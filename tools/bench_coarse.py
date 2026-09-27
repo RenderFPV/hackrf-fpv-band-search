@@ -52,16 +52,33 @@ def main() -> int:
         real_iq = src.take_iq(16_384)
         src.stop()
 
-    cases = [("sim noise", noise), ("sim video", video), ("real capture", real_iq)]
+    # Only offer a case that has samples to measure. With no capture present --
+    # the normal case for a fresh clone and for CI -- the previous code built a
+    # cases list containing an empty array, and the "use as many segments as
+    # fit" fallback below then asked for two averages of a zero-length block.
+    # That is an FFT of nothing, and it raised ValueError: Invalid number of FFT
+    # data points (0). Two simulator cases measure the same statistic, so
+    # skipping the absent one costs the measurement nothing.
+    cases = [("sim noise", noise), ("sim video", video)]
+    if real_iq.size:
+        cases.append(("real capture", real_iq))
+    else:
+        print("no capture found; measuring the simulator cases only.\n")
     for nfft, averages in ((1024, 8), (2048, 8), (2048, 16), (2048, 48), (2048, 128)):
         need = nfft * 2 * averages
         print(f"nfft={nfft} averages={averages} "
               f"(needs {need/1000:.0f}k samples, {need/fs*1000:.1f} ms)")
         print(f"  {'case':12s} {'peak-med':>9s} {'bins>med+6':>11s} {'bin kHz':>8s}")
         for name, iq in cases:
+            if iq.size < 2 * nfft:
+                # Not even one full FFT block. The old code clamped the average
+                # count up to 2 with max(2, ...), which asked for more segments
+                # than the buffer held; the PSD then averaged nothing.
+                print(f"  {name:12s} (too few samples to FFT: {iq.size} < {2*nfft})")
+                continue
             if iq.size < need:
                 # emulate the shorter dwell by using as many segments as fit
-                av = max(2, int(iq.size // (2 * nfft)))
+                av = max(1, int(iq.size // (2 * nfft)))
                 pm, bk, ab = stats(iq, fs, nfft, av)
                 print(f"  {name:12s} {pm:9.1f} {ab:11d} {bk:8.2f}   "
                       f"(only {av} averages fit in 16k)")

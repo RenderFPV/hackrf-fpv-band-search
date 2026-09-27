@@ -13,6 +13,28 @@ python main.py --check                             # verify a source and exit
 
 MIT licensed. See [LICENSE](LICENSE).
 
+## Requirements
+
+Python 3.12 or newer, and:
+
+```
+pip install -r requirements.txt
+```
+
+That is three packages — numpy, scipy, PySide6 — and it is deliberately all the
+**application** needs. `fpv_rf` never imports Pillow: the picture downscale is
+`scipy.ndimage.zoom` rather than a resize, so the packaged `.exe` does not carry
+an imaging library it would not otherwise use.
+
+To run the checks as well, which need one more:
+
+```
+pip install -r requirements-dev.txt
+```
+
+Five scripts under `tools/` use Pillow, and only to write a PNG of a decoded
+frame so a human can look at it. Nothing in the decode path touches it.
+
 ## The .exe app
 
 ```
@@ -275,6 +297,7 @@ fpv_rf/alerts.py        identity, dedupe, cooldown, log, beep
 fpv_rf/ui.py            PySide6 window, band chart widget, alert panel
 tools/                  the checks below
 tools/_paths.py         resolves the optional real capture, no hardcoded paths
+tools/check_workflow.py validates .github/workflows/checks.yml before pushing
 tools/archive/          development scaffolding; nothing runs it automatically
 docs/                   the screenshots this README shows
 ```
@@ -288,6 +311,7 @@ python tools\check_alerts.py      # dedupe, cooldown, lost, identity
 python tools\check_ui.py          # the real Qt window, offscreen, with screenshots
 python tools\check_layout.py      # nothing clipped, nothing squeezed
 python tools\check_worker.py      # streaming frame rate
+python tools\check_workflow.py    # the CI workflow is valid and self-consistent
 python tools\check_hardware_scan.py  # a real sweep of a real, empty band
 python tools\bench_sim.py         # the simulator sustains real time
 python tools\bench_coarse.py      # the coarse gate's false-positive rate
@@ -296,6 +320,28 @@ python tools\diag_spurs.py        # is that carrier the band, or the radio?
 python tools\diag_peak_bin.py     # names the exact bin a "carrier" sits in
 python build_exe.py               # build the .exe, then verify it did not break
 ```
+
+The first nine run with no hardware and no capture. The three after
+`check_hardware_scan.py` all need the HackRF plugged in.
+
+### Continuous integration
+
+`.github/workflows/checks.yml` runs the nine on every push and pull request, on
+both Linux and Windows, because none of them need a radio. The Windows leg is
+not redundant: a missing directory, a hardcoded path and an undeclared
+dependency all behave identically on either platform, and the shipping target
+with the Windows-only timer, subprocess and `winsound` paths is Windows.
+
+Two things are deliberately **not** gates, and the workflow says so in its own
+header rather than leaving it to be inferred:
+
+- `bench_sim.py` measures a wall-clock deadline. On a shared runner any
+  co-tenant taking CPU fails the build for a change that did not cause it, so it
+  is reported and ignored.
+- `check_sources.py` and `check_frame_structure.py` assert no threshold. They
+  exist to catch a crash in the end-to-end path, and a non-zero exit still fails
+  the step. `check_frame_structure.py` reads frames that other checks wrote, so
+  on its own it says what it examined rather than printing nothing.
 
 `check_hardware_scan.py` needs the HackRF and is the only one that needs nothing
 transmitting to be meaningful — it asserts the *absence* of a finding. It is

@@ -1,0 +1,17 @@
+# Dependencies for running the checks, not for running the app.
+#
+# The split is deliberate and load-bearing. requirements.txt holds the three
+# things the application itself needs, and the packaged build ships only those
+# three -- which is why fpv_rf never imports Pillow: the display downscale is
+# gaussian_filter plus scipy.ndimage.zoom precisely so the .exe does not carry
+# an imaging library it would not otherwise need.
+#
+# Pillow is needed by five scripts under tools/, and only to write a PNG of a
+# decoded frame so a human can look at it. Nothing in the decode path uses it.
+# It was previously undeclared and merely happened to be installed on the
+# machine that developed this, so a fresh clone would have failed on the first
+# check that saved a frame. CI installs this file for exactly that reason.
+
+-r requirements.txt
+
+Pillow>=10.0

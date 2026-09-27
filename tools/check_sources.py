@@ -14,6 +14,7 @@ from tools.check_frame import row_correlation  # noqa: E402
 from tools.validate_dsp import DEFAULT, load_u8  # noqa: E402
 
 FS = 10_000_000
+OUT = Path("_validate_out")
 
 
 def report(tag, iq):
@@ -36,10 +37,11 @@ def report(tag, iq):
           f"row={row_correlation(fr.image):+.3f} mean={fr.image.mean():.1f}")
     from PIL import Image
 
-    Image.fromarray(fr.image, "L").save(f"_validate_out/chk_{tag}.png")
+    Image.fromarray(fr.image, "L").save(OUT / f"chk_{tag}.png")
 
 
 def main() -> int:
+    OUT.mkdir(exist_ok=True)
     src = sdr.SimSource(video=True)
     src.start()
     time.sleep(1.4)
@@ -52,7 +54,16 @@ def main() -> int:
     report("sim_noise", src.take_iq(400_000))
     src.stop()
 
-    report("real_capture", load_u8(DEFAULT, 8_000_000))
+    # No capture is the normal case for a fresh clone, and it is not a failure:
+    # the sim and noise cases above are what CI can actually verify. Only the
+    # extra realism of a real recording is unavailable, and saying so is more
+    # useful than dying inside np.fromfile with a bare FileNotFoundError.
+    if DEFAULT.exists():
+        report("real_capture", load_u8(DEFAULT, 8_000_000))
+    else:
+        print("--- real_capture: SKIPPED (no capture found)")
+        print(f"    looked for {DEFAULT}")
+        print("    record one with:  python tools/record_sample.py")
     return 0
 
 

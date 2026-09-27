@@ -42,11 +42,25 @@ def describe(name: str, img: np.ndarray) -> None:
 
 def main() -> int:
     out = Path("_validate_out")
+    seen = missing = 0
     for fn in ("worker_frame.png", "chk_sim_video.png", "chk_real_capture.png"):
         p = out / fn
         if p.exists():
             describe(fn, np.array(Image.open(p)))
             print()
+            seen += 1
+        else:
+            missing += 1
+    # This script reports on frames other checks have already written; it has
+    # no assertion of its own and always exits 0. That is a deliberate choice,
+    # but a silent one is a trap: finding no files printed nothing at all and
+    # looked exactly like a pass. Say what was examined instead.
+    if not seen:
+        print(f"no frames to examine in {out}/ -- run check_worker.py or "
+              f"check_sources.py first to produce some")
+    elif missing:
+        print(f"examined {seen} frame(s); {missing} not present (the producing "
+              f"check was skipped, or has not been run)")
     return 0
 
 
