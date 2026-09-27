@@ -158,19 +158,56 @@ having found your quad.
 
 ## The amplifier
 
-There is an **LNA amp** checkbox beside the LNA gain. A HackRF has no separate
-amp power switch: the LNA is bypassed by asking for 0 dB of LNA gain, which is
-what the checkbox does, and it restores your previous gain when you switch it
-back on.
+There is an **RF amp** checkbox beside the LNA gain, and it is a real bypass,
+not a gain reduction: the transfer helper takes `-a 0` and the amplifier is off.
+That is a different thing from asking for 0 dB of LNA gain, which leaves the LNA
+powered and merely stops it amplifying. The first version of this control did
+the 0 dB thing and was wrong.
 
-It is worth having as its own control because the alternative — typing 0 into
-the LNA box — loses your setting and looks like the same control as the VGA.
-Switching it off is how you check whether a strong nearby transmitter is being
-amplified into your own noise floor or is genuinely out there.
+It is worth having as its own control because of what it diagnoses. Amplified
+noise floor looks exactly like a weak transmitter, so switch the amplifier off:
+if the reading survives, the energy is really out there.
 
-It costs a retune, like any change to the LNA gain: the gains are command-line
-arguments to the transfer process, so they can only change when that process is
-replaced. Not a control to flick mid-sweep.
+Two caveats, both in the tooltip:
+
+- **It needs a helper that has the flag.** `-a` is a Mayhem extension. The stock
+  Great Scott build does not have it, and it treats an unknown option as a
+  usage error, so passing it unconditionally would turn a working install into
+  a dead radio. The app therefore asks the binary which flags it understands
+  (`hackrf_transfer -h`) and omits `-a` when it is not there, leaving the
+  checkbox disabled with an explanation rather than silently doing nothing.
+- **It costs a retune**, like any change to the gains: the flags are
+  command-line arguments, so they can only change when the process is replaced.
+  Not a control to flick mid-sweep.
+
+## If the radio does not appear
+
+`hackrf_open() failed: HackRF not found (-5)` means one of three quite different
+things, and the app's own report does not distinguish them:
+
+| Meaning | Usual cause |
+|---|---|
+| The device is there but busy | Another program holds it — SDR#, Mayhem, a browser tab with a WebUSB app |
+| The device is there, driver wrong | WinUSB or the libusb filter is not bound to `USB\VID_1D50&PID_6089` |
+| **The device is not enumerating at all** | Cable, port, or power |
+
+The third is worth checking directly, because nothing in the app's output can
+tell you about it, and it is the one that looks identical to the other two from
+the outside. In PowerShell:
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object InstanceId -match 'VID_1D50'
+```
+
+An empty result means Windows cannot see the radio at all, and no amount of
+retrying in software will help. Check in this order: a different port (a USB 2
+port directly on the machine, not through a hub — a HackRF draws about 250 mA
+and some ports will not enumerate it), a different cable (charge-only USB-C
+cables are common and carry no data), and that the radio's own LED is lit.
+
+A `Get-PnpDevice` entry that exists but reports `IsPresent=False` is a *ghost* —
+a leftover from a previous session, not proof that anything is plugged in now.
+
 
 ## The alert
 

@@ -756,17 +756,29 @@ class MainWindow(QMainWindow):
         gv.addWidget(QLabel("VGA dB"), 3, 0)
         gv.addWidget(self.vga, 3, 1)
 
-        self.amp = QCheckBox("LNA amp")
+        self.amp = QCheckBox("RF amp")
         self.amp.setChecked(True)
         self.amp.setToolTip(
-            "Switch the LNA stage off, or back to the gain that was set.\n\n"
-            "A HackRF has no separate amp power switch -- the LNA is bypassed\n"
-            "by asking for 0 dB, which is what this does. Turning it off is how\n"
-            "you see whether a strong nearby transmitter is being amplified\n"
-            "into your own noise floor, or is genuinely out there.\n\n"
-            "It costs a retune, like any change to the LNA gain."
+            "Switch the RF amplifier off, or back on.\n\n"
+            "A real bypass (-a 0), not a gain reduction: the amplifier is off, "
+            "not turned down. Requires a transfer helper that supports the "
+            "flag; the stock Great Scott build does not, and then this control "
+            "is inert.\n\n"
+            "The point of it is diagnosis. Amplified noise floor looks exactly "
+            "like a weak transmitter, so switch the amplifier off: if the "
+            "reading survives, the energy is really out there.\n\n"
+            "It costs a retune, like any change to the gains."
         )
         self.amp.toggled.connect(self._on_amp)
+        if not getattr(self.source, "amp_supported", True):
+            self.amp.setChecked(False)
+            self.amp.setEnabled(False)
+            self.amp.setToolTip(
+                "This build of hackrf_transfer has no -a flag, so the "
+                "amplifier cannot be switched from here.\n\n"
+                "The Mayhem build has it. Download that firmware's utils "
+                "folder and point HACKRF_TRANSFER at its hackrf_transfer.exe."
+            )
         gv.addWidget(self.amp, 2, 2)
         v.addWidget(g)
 
@@ -1006,28 +1018,27 @@ class MainWindow(QMainWindow):
         self._start_scan(band.frequency_span()[0], band.frequency_span()[1])
 
     def _on_amp(self, on: bool) -> None:
-        """Switch the LNA stage off, or back to the gain that was set.
+        """Switch the RF amplifier off, or back on.
 
-        A HackRF has no separate amp power switch: the LNA is bypassed by asking
-        for 0 dB of LNA gain, so that is what this does. It is worth an explicit
-        control anyway, because the alternative -- typing 0 into the LNA box --
-        loses the previous setting and looks like the same control as the VGA.
+        This is a real switch, not a gain: the transfer helper takes ``-a 0`` to
+        bypass the amplifier entirely. That is a different thing from asking for
+        0 dB of LNA gain, which leaves the LNA powered and only stops it
+        amplifying -- the first version of this control did that, and it was
+        wrong.
 
-        It costs a retune, exactly as changing the LNA gain always has: the
-        gains are command-line arguments to the transfer process, so they can
-        only change when that process is replaced. On hardware that is the
-        dominant per-hop cost, so this is not a control to flick mid-sweep.
+        Worth having as its own control for what it diagnoses: with the
+        amplifier off, a signal that was really just your own noise floor
+        amplified stops looking like a transmitter. If a strong reading survives
+        switching it off, the energy is out there.
+
+        Costs a retune, like any LNA or gain change: the flags are command-line
+        arguments, so they can only change when the process is replaced. Not a
+        control to flick mid-sweep.
         """
-        if on:
-            target = self._lna_saved_db
-        else:
-            target = 0
+        if not on:
             self._lna_saved_db = self.lna.value()
-        self.lna.blockSignals(True)
-        self.lna.setValue(target)
-        self.lna.blockSignals(False)
-        self.lna.setEnabled(on)
-        self._on_gain(0)
+        self.source.amp_enabled = bool(on)
+        self._tune(self.source.frequency_hz, ask_alert=False)
 
     def _on_gain(self, _v: int) -> None:
         self.source.lna_gain_db = self.lna.value()

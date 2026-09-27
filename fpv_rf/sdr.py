@@ -33,9 +33,11 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+import re
 
 # 10 MS/s sustains a native NTSC/PAL field rate: 60 fields/s needs
 # 10.014 MS/s and 50 fields/s needs 9.98 MS/s, so this is the one rate that
@@ -106,6 +108,36 @@ def app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
+
+
+@lru_cache(maxsize=4)
+def supported_flags(executable: str) -> frozenset[str]:
+    """Which single-letter options this ``hackrf_transfer`` build accepts.
+
+    Builds differ. The Mayhem build has ``-a`` (RF amplifier), ``-p`` (antenna
+    port power), ``-o`` (front-end LO) and ``-i``; the stock Great Scott build
+    has none of them and treats an unknown option as a usage error, so a flag
+    that is correct on one machine is fatal on another. Rather than guess from
+    the file name, ask the binary once and cache the answer for the process.
+
+    A probe that fails yields the empty set, which means "pass nothing
+    optional" -- the safe direction, since every optional flag here is a
+    refinement rather than a requirement.
+    """
+    try:
+        r = subprocess.run(
+            [executable, "-h"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return frozenset()
+    # The help text is inconsistent about brackets: most options are spelled
+    # "[-a amp_enable]" but the receive and write options are bare "-r <file>".
+    # Matching only the bracketed form silently under-reports what the build
+    # supports, which is the same class of bug as assuming a flag is absent.
+    # Anchoring to the start of a line skips prose like "use '-' for stdout",
+    # where the dash is not followed by a letter.
+    text = f"{r.stdout or ''}\n{r.stderr or ''}"
+    return frozenset(re.findall(r"(?m)^\s*\[?-([A-Za-z])(?=[\s\]>])", text))
 
 
 def find_hackrf_transfer() -> str | None:
@@ -335,6 +367,11 @@ class IQSource(ABC):
     #: frequency -- so callers must ask instead of assuming.
     retunable = True
 
+    #: Whether the RF amplifier can be switched from the UI. True generally;
+    #: the file and simulator sources override it, and a HackRF decides it by
+    #: asking its transfer helper which flags it understands.
+    amp_supported = True
+
     def __init__(self, sample_rate: int = DEFAULT_SAMPLE_RATE) -> None:
         self.sample_rate = int(sample_rate)
         self.ring = IQRing()
@@ -342,6 +379,13 @@ class IQSource(ABC):
         self.frequency_hz = 0
         self.lna_gain_db = 0
         self.vga_gain_db = 0
+        #: RF amplifier on/off. This is a real switch, not a proxy: the
+        #: Mayhem ``hackrf_transfer`` takes ``-a 1`` / ``-a 0``, so the
+        #: amplifier is genuinely bypassed rather than turned down. It is
+        #: separate from the LNA gain -- asking for 0 dB of LNA gain is a
+        #: different thing entirely, and the first version of this control got
+        #: that wrong.
+        self.amp_enabled = True
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tune_lock = threading.Lock()
@@ -504,7 +548,7 @@ class HackrfSource(IQSource):
     def _cmdline(self) -> list[str]:
         assert self.executable
         # -r must come first: a bare '-' ends option parsing.
-        return [
+        cmd = [
             self.executable,
             "-r", "-",
             "-f", str(int(self.frequency_hz)),
@@ -512,6 +556,17 @@ class HackrfSource(IQSource):
             "-l", str(int(self.lna_gain_db)),
             "-g", str(int(self.vga_gain_db)),
         ]
+        # -a is a Mayhem extension. The stock Great Scott build has no such flag
+        # and rejects the whole command line when it sees one, so passing it
+        # unconditionally would turn a working install into a dead radio. Probe
+        # once per executable instead.
+        if self.amp_supported:
+            cmd += ["-a", "1" if self.amp_enabled else "0"]
+        return cmd
+
+    @property
+    def amp_supported(self) -> bool:
+        return bool(self.executable) and supported_flags(self.executable) >= {"a"}
 
     def _spawn(self) -> None:
         assert self.executable
@@ -800,6 +855,8 @@ class FileSource(IQSource):
         frequency_hz: int = 0,
     ) -> None:
         super().__init__(sample_rate)
+        # A recording has no amplifier to switch, so the control would be a lie.
+        self.amp_supported = False
         self.path = Path(path)
         self.loop = loop
         self.realtime = realtime
