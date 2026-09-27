@@ -25,6 +25,21 @@ HARDWARE_ONLY = {"check_hardware_scan", "diag_spurs", "diag_peak_bin"}
 #: which is the whole thing this check exists to catch.
 DIST = {"pil": "pillow", "numpy": "numpy", "scipy": "scipy", "pyside6": "pyside6"}
 
+#: Constructs that only parse under bash. A windows runner runs `run:` with pwsh
+#: unless the step says `shell: bash`, and a bash loop then dies at *parse* time
+#: -- before executing anything -- so the job fails with a message that points
+#: at the workflow rather than at the code. That is exactly what happened to the
+#: first version of this workflow: Ubuntu passed, Windows reported
+#: "Missing opening '(' after keyword 'for'".
+BASH_ONLY = (
+    (re.compile(r"^\s*set\s+-[a-z]*o\b", re.M), "set -o"),
+    (re.compile(r"^\s*for\s+\w+\s+in\b", re.M), "a for-in loop"),
+    (re.compile(r"^\s*do\s*$", re.M), "a do/done loop"),
+    (re.compile(r"^\s*done\s*$", re.M), "a do/done loop"),
+    (re.compile(r"\\\s*$", re.M), "a backslash line continuation"),
+    (re.compile(r"\$\{[A-Za-z_]"), "${VAR} expansion"),
+)
+
 problems: list[str] = []
 
 
@@ -98,6 +113,34 @@ def main() -> int:
             problems.append(f"workflow installs {req}, which does not exist")
         else:
             print(f"  installs  {req}  (exists)")
+
+    # A step whose body only parses under bash must say so, or it breaks on any
+    # matrix leg that defaults to pwsh. Steps restricted to Linux are exempt:
+    # they never reach a Windows runner.
+    matrix_os = job.get("strategy", {}).get("matrix", {}).get("os", [])
+    windows_leg = any("windows" in str(o) for o in matrix_os)
+    print(f"\n  windows leg: {windows_leg}")
+    for step in job["steps"]:
+        run = step.get("run", "")
+        if not run:
+            continue
+        cond = str(step.get("if", ""))
+        linux_only = "Linux" in cond
+        shell = step.get("shell", "(default)")
+        found = sorted({label for rx, label in BASH_ONLY if rx.search(run)})
+        name = step.get("name", "?")
+        if not found:
+            print(f"    ok        {name}: no bash-only syntax")
+        elif linux_only:
+            print(f"    exempt    {name}: {', '.join(found)} (Linux-only step)")
+        elif shell == "bash":
+            print(f"    ok        {name}: {', '.join(found)} but shell: bash is set")
+        else:
+            problems.append(
+                f"step {name!r} uses {', '.join(found)} but runs with {shell!r}; "
+                f"a Windows runner would fail to parse it. Add `shell: bash`."
+            )
+            print(f"    PROBLEM   {name}: {', '.join(found)} with {shell!r}")
 
     # Every dependency any tools/ script imports must be declared somewhere.
     declared = set()

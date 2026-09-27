@@ -67,9 +67,14 @@ jobs:
         os: [ubuntu-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to v7 of each. The first version of this file used checkout@v4,
+      # setup-python@v5 and upload-artifact@v4, which target Node 20; GitHub
+      # warned on every run that they are deprecated and are being forced onto
+      # Node 24, and that forcing will not last. Versions confirmed against the
+      # repositories rather than assumed.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # Developed and verified on 3.14; 3.12 is the oldest with wheels for
           # numpy, scipy and PySide6 alike, so this also checks the code is not
@@ -99,6 +104,12 @@ jobs:
             libgl1 libegl1 libxkbcommon0 libdbus-1-3 libxkbcommon-x11-0
 
       - name: Threshold checks
+        # bash, not the Windows default. A windows runner executes `run:` with
+        # pwsh, and this loop is bash: the first Windows run of this workflow
+        # died with "Missing opening '(' after keyword 'for'" before a single
+        # check had executed, while Ubuntu passed. Git Bash is present on every
+        # windows runner, so asking for it explicitly is the portable answer.
+        shell: bash
         run: |
           set -o pipefail
           status=0
@@ -116,10 +127,11 @@ jobs:
       - name: Smoke checks
         # These report rather than assert; they exist to catch a crash in the
         # end-to-end path. A non-zero exit still fails the step.
+        shell: bash
         run: |
           set -o pipefail
           status=0
-          for check in check_sources check_frame_structure; do
+          for check in check_sources check_frame_structure check_workflow; do
             echo ""
             echo "::group::$check"
             python "tools/$check.py" || status=1
@@ -137,7 +149,7 @@ jobs:
         # failure they are the fastest way to see what the window actually did,
         # so they are worth keeping either way.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frames-${{ matrix.os }}
           path: _validate_out/
