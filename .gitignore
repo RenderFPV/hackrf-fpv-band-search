@@ -1,0 +1,33 @@
+# Build output. The packaged app is 212 MB across 380 files, and PyInstaller's
+# work directory is another 30 MB. Neither belongs in git: the first commit
+# would be larger than the entire rest of the project by two orders of
+# magnitude, and `git log` can never shed them. Rebuild with `python build_exe.py`.
+/dist/
+/build/
+*.spec
+
+# Generated at runtime, next to whichever copy of the app is running.
+fpv-rf.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Scratch output from the checks in tools/. Screenshots that the README actually
+# shows are committed under docs/ instead, so the documentation does not break.
+/_validate_out/
+
+# Optional real-hardware captures. tools/_paths.py looks here, and a 38 MB .u8
+# is not something to commit. Point $FPV_CAPTURE at one instead.
+/samples/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

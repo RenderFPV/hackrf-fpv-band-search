@@ -1,0 +1,11 @@
+# Normalise line endings in the repository, and check them out as the platform
+# prefers. Without this, Git warns about every single file on Windows and the
+# blob hashes end up depending on who cloned the repo and with what settings --
+# which makes diffs between a Windows and a Linux checkout noisy for no reason.
+* text=auto
+
+# Binary, and must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.u8 binary
