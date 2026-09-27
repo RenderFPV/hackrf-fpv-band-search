@@ -281,12 +281,20 @@ class BandChart(QWidget):
     let the operator see that the thing they want is 3 MHz from where the scan
     says it is.
 
-    Click a channel to tune it. Shift-click to *not* tune anything -- the way to
-    inspect a chart entry without losing the picture.
+    Click a channel to tune it. Click anywhere else in a row to make that band
+    plan the active one, which scopes both the search and auto-select to it.
+    Shift-click a row to sweep that band plan and nothing else.
     """
 
-    channelClicked = Signal(int)          # frequency in Hz
-    rowClicked = Signal(int)              # band index
+    # object, not int, and this is not a style preference. Qt's `int` is a 32-bit
+    # C int, and a frequency in Hz is around 5.8e9. Declaring this `Signal(int)`
+    # truncated every click to a 32-bit value (5865000000 -> 1570032704) and the
+    # slot then failed to resolve at all, so clicking a channel on the chart did
+    # nothing and Qt logged an AttributeError nobody was watching for. The
+    # integer arrives intact.
+    channelClicked = Signal(object)       # frequency in Hz, a Python int
+    bandActivated = Signal(int)           # band index, now the active plan
+    bandScanRequested = Signal(int)       # band index, sweep this plan only
 
     MARGIN_L = 58
     MARGIN_R = 12
@@ -303,7 +311,21 @@ class BandChart(QWidget):
         self.marks: list[_Mark] = []
         self.tune_hz = 0
         self.selected_hz = 0
+        self.active_row: int | None = None
         self._hover: tuple[int, int] | None = None     # (row, channel index)
+
+    @property
+    def active_band(self) -> bands.Band | None:
+        """The band plan the operator has chosen, if any."""
+        if self.active_row is None:
+            return None
+        if 0 <= self.active_row < len(self.band_list):
+            return self.band_list[self.active_row]
+        return None
+
+    def set_active_row(self, row: int | None) -> None:
+        self.active_row = row
+        self.update()
 
     def set_span(self, lo_hz: int, hi_hz: int) -> None:
         """Set the region span, widened to cover the band plans being drawn.
@@ -408,13 +430,20 @@ class BandChart(QWidget):
         for row, band in enumerate(self.band_list):
             y = r.top() + row * (self.ROW_H + self.ROW_GAP)
             rect = QRectF(r.left(), y, r.width(), self.ROW_H)
-            p.fillRect(rect, QColor(30, 30, 36))
-            p.setPen(QColor(150, 150, 160))
+            active = row == self.active_row
+            p.fillRect(rect, QColor(38, 42, 56) if active else QColor(30, 30, 36))
+            p.setPen(QColor(120, 170, 255) if active else QColor(150, 150, 160))
             p.drawText(
                 QRectF(2, y, self.MARGIN_L - 6, self.ROW_H),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 band.key,
             )
+            if active:
+                # An outline, not just a fill: the active row has to be
+                # identifiable at a glance while the operator is watching the
+                # picture rather than the chart.
+                p.setPen(QPen(QColor(90, 150, 255), 1))
+                p.drawRect(rect.adjusted(0, 0, -1, -1))
             for m in self.marks:
                 if band.key not in m.text:
                     continue
@@ -450,10 +479,13 @@ class BandChart(QWidget):
             p.drawLine(QPointF(x, r.top() - 4), QPointF(x, r.bottom() + 4))
 
         p.setPen(QColor(100, 100, 112))
+        active = self.active_band
+        scope = f"scoping to {active.key}" if active else "all bands"
         p.drawText(
             QRectF(r.left(), r.bottom() + 4, r.width(), 14),
             Qt.AlignmentFlag.AlignRight,
-            f"{len(self.marks)} finding(s)  |  click a tick to tune",
+            f"{len(self.marks)} finding(s)  |  {scope}  |  "
+            f"click a tick to tune, a row to scope, shift-click to sweep",
         )
 
     # -- input -------------------------------------------------------------
@@ -479,14 +511,36 @@ class BandChart(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        hit = self._channel_at(event.position())
-        if not hit:
+        """Tune a tick, pick a band, or sweep a band.
+
+        Three gestures on one widget, so which one a click means has to be
+        decided by what is under the pointer and never by what feels natural to
+        guess at. A tick is a frequency and tunes it. The rest of the row is
+        band *identity*, and selecting it is what scopes the search -- which is
+        the thing an operator racing on one plan actually wants, and which
+        previously had no gesture at all outside a 9 MHz box around each tick.
+        Shift is the explicit "sweep this plan" and is deliberately not the
+        default, because it starts a sweep the operator then has to wait for.
+        """
+        pos = event.position()
+        hit = self._channel_at(pos)
+        row = self._row_at(pos.y())
+        in_row = 0 <= row < len(self.band_list)
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+        if in_row and shift:
+            self.bandScanRequested.emit(row)
             return
-        band = self.band_list[hit[0]]
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self.rowClicked.emit(hit[0])
+        if hit:
+            self.channelClicked.emit(self.band_list[hit[0]].channels[hit[1]])
             return
-        self.channelClicked.emit(band.channels[hit[1]])
+        if in_row:
+            self.bandActivated.emit(row)
+            return
+        # A click on empty space below the last row clears the scoping, so
+        # there is a way back to "search everything" that is not a restart.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.bandActivated.emit(-1)
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +657,14 @@ class MainWindow(QMainWindow):
         self._scan_thread: ScanThread | None = None
         self._last_result: scan.ScanResult | None = None
         self._last_event: alerts.AlertEvent | None = None
+        #: Band plan the operator picked on the chart, scoping search and
+        #: auto-select. None means "every plan", which is the startup state
+        #: because a default would silently hide channels on the other plans.
+        self._active_band: bands.Band | None = None
+        #: LNA setting to restore when the amp is switched back on. Remembered
+        #: rather than hard-coded so switching the amp off and on again is not
+        #: a way to lose your gain setup.
+        self._lna_saved_db = int(source.lna_gain_db)
 
         self.setWindowTitle("FPV band search and alert")
         self._build()
@@ -631,6 +693,9 @@ class MainWindow(QMainWindow):
         self._status = sb
 
         self.banner.set_idle()
+        # The status bar and the scan button both read the active band, so this
+        # has to come after both exist.
+        self._update_scan_label()
 
     def _build_video(self) -> QWidget:
         box = QWidget()
@@ -645,7 +710,8 @@ class MainWindow(QMainWindow):
         self.chart = BandChart()
         self.chart.set_span(*bands.default_scan_span(self.args.region))
         self.chart.channelClicked.connect(self._on_channel_clicked)
-        self.chart.rowClicked.connect(self._on_row_clicked)
+        self.chart.bandActivated.connect(self._on_band_activated)
+        self.chart.bandScanRequested.connect(self._on_band_scan)
         v.addWidget(self.chart, 2)
         return box
 
@@ -689,6 +755,19 @@ class MainWindow(QMainWindow):
         self.vga.valueChanged.connect(self._on_gain)
         gv.addWidget(QLabel("VGA dB"), 3, 0)
         gv.addWidget(self.vga, 3, 1)
+
+        self.amp = QCheckBox("LNA amp")
+        self.amp.setChecked(True)
+        self.amp.setToolTip(
+            "Switch the LNA stage off, or back to the gain that was set.\n\n"
+            "A HackRF has no separate amp power switch -- the LNA is bypassed\n"
+            "by asking for 0 dB, which is what this does. Turning it off is how\n"
+            "you see whether a strong nearby transmitter is being amplified\n"
+            "into your own noise floor, or is genuinely out there.\n\n"
+            "It costs a retune, like any change to the LNA gain."
+        )
+        self.amp.toggled.connect(self._on_amp)
+        gv.addWidget(self.amp, 2, 2)
         v.addWidget(g)
 
         # -- search ------------------------------------------------------
@@ -756,6 +835,17 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._on_cancel)
         gv.addWidget(self.cancel_btn, 3, 2)
+
+        self.autotune = QCheckBox("tune it automatically")
+        self.autotune.setChecked(True)
+        self.autotune.setToolTip(
+            "When a search finds something, tune it and show it, instead of\n"
+            "making you press Auto-select afterwards.\n\n"
+            "Still declines when there is nothing above the noise floor, and\n"
+            "when the active band has nothing on it. Finding a signal and\n"
+            "watching it are one action, not two."
+        )
+        gv.addWidget(self.autotune, 4, 0, 1, 3)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -851,6 +941,30 @@ class MainWindow(QMainWindow):
         region = self.region.currentData()
         lo, hi = bands.default_scan_span(region)
         self.chart.set_span(lo, hi)
+        # A new region is a new set of legal channels and a new default sweep,
+        # so a band chosen under the old one would silently keep scoping the new
+        # search to a plan the operator never picked here.
+        self._active_band = None
+        self.chart.set_active_row(None)
+
+    def _update_scan_label(self) -> None:
+        """Put the actual sweep width on the button.
+
+        On hardware the sweep is dominated by one tuner settling period per
+        hop, so the width of the span *is* the wait. An operator who cannot see
+        it has no way to connect "this takes ages" to the control that fixes it.
+        """
+        lo, hi = self._search_span()
+        width_mhz = (hi - lo) / 1e6
+        self.scan_btn.setText(f"Scan band  ({width_mhz:.0f} MHz)")
+        self.scan_btn.setToolTip(
+            f"Sweep {bands.format_mhz(lo)}-{bands.format_mhz(hi)} "
+            f"({width_mhz:.0f} MHz) at a coarse grid and report every frequency "
+            f"with energy above the noise floor.\n\n"
+            f"On real hardware each hop costs a tuner settling period, so the "
+            f"time is roughly proportional to this width. Click a band row on "
+            f"the chart to scope the sweep to one plan."
+        )
 
     def _on_freq_spin(self, mhz: int) -> None:
         self._tune(int(mhz) * 1_000_000, ask_alert=True)
@@ -863,18 +977,65 @@ class MainWindow(QMainWindow):
             self.freq.blockSignals(False)
         self._tune(freq_hz, ask_alert=True)
 
-    def _on_row_clicked(self, row: int) -> None:
+    def _on_band_activated(self, row: int) -> None:
+        """Click a band row: make that plan the one search and auto-select use.
+
+        ``row < 0`` is a click on empty space, which clears the scoping. Without
+        it, picking a band would be a one-way door for the rest of the session.
+        """
+        if row < 0:
+            self._active_band = None
+            self.chart.set_active_row(None)
+            self._update_scan_label()
+            self._status.showMessage("searching every band plan")
+            return
+        band = self.chart.band_list[row]
+        self._active_band = band
+        self.chart.set_active_row(row)
+        self._update_scan_label()
+        lo, hi = band.frequency_span()
+        self._status.showMessage(
+            f"{band.label} is the active band -- search and auto-select now "
+            f"look only at {bands.format_mhz(lo)}-{bands.format_mhz(hi)}"
+        )
+
+    def _on_band_scan(self, row: int) -> None:
         """Shift-click a band row: sweep just that band plan."""
         band = self.chart.band_list[row]
         self._status.showMessage(f"scanning the {band.label} band plan only")
         self._start_scan(band.frequency_span()[0], band.frequency_span()[1])
+
+    def _on_amp(self, on: bool) -> None:
+        """Switch the LNA stage off, or back to the gain that was set.
+
+        A HackRF has no separate amp power switch: the LNA is bypassed by asking
+        for 0 dB of LNA gain, so that is what this does. It is worth an explicit
+        control anyway, because the alternative -- typing 0 into the LNA box --
+        loses the previous setting and looks like the same control as the VGA.
+
+        It costs a retune, exactly as changing the LNA gain always has: the
+        gains are command-line arguments to the transfer process, so they can
+        only change when that process is replaced. On hardware that is the
+        dominant per-hop cost, so this is not a control to flick mid-sweep.
+        """
+        if on:
+            target = self._lna_saved_db
+        else:
+            target = 0
+            self._lna_saved_db = self.lna.value()
+        self.lna.blockSignals(True)
+        self.lna.setValue(target)
+        self.lna.blockSignals(False)
+        self.lna.setEnabled(on)
+        self._on_gain(0)
 
     def _on_gain(self, _v: int) -> None:
         self.source.lna_gain_db = self.lna.value()
         self.source.vga_gain_db = self.vga.value()
         self._tune(self.source.frequency_hz, ask_alert=False)
 
-    def _tune(self, freq_hz: int, ask_alert: bool = False) -> None:
+    def _tune(self, freq_hz: int, ask_alert: bool = False,
+              clear_alerts: bool = True) -> None:
         if not self.source.tune(freq_hz):
             QMessageBox.warning(
                 self, "Tune failed",
@@ -887,33 +1048,73 @@ class MainWindow(QMainWindow):
         # from a different channel.
         self.source.reset_drain()
         self.worker.reset()
-        self.alerts.clear()
+        # Clearing is right when the operator moved the tuner themselves: what
+        # was found on the old channel is no longer what they are looking at.
+        # It is wrong when *we* moved the tuner onto a channel the search just
+        # found, because the finding is still true and still current -- clearing
+        # there would drop it from the seen-map and make the next sweep raise an
+        # identical alert for the same drone.
+        if clear_alerts:
+            self.alerts.clear()
         self.chart.set_tune(self.source.frequency_hz)
         if ask_alert:
             self._check_current()
 
+    def _search_span(self) -> tuple[int, int]:
+        """What 'Scan band' sweeps: the active band plan if one is chosen.
+
+        Scoping the *sweep* to the active band is the point of choosing one. It
+        is also the single biggest lever on sweep time, since on hardware every
+        MHz of span is retune time -- Raceband's 8 channels are a fifth of the
+        US region span, so scoping is the difference between a sweep you wait
+        for and one you do not.
+        """
+        if self._active_band is not None:
+            return self._active_band.frequency_span()
+        return bands.default_scan_span(self.region.currentData())
+
     def _on_scan(self) -> None:
-        region = self.region.currentData()
-        lo, hi = bands.default_scan_span(region)
+        lo, hi = self._search_span()
         self._start_scan(lo, hi)
 
     def _on_auto(self) -> None:
+        self._select_best(announce=True)
+
+    def _select_best(self, announce: bool) -> bool:
+        """Tune the best decodable candidate from the last search, if any.
+
+        Returns whether it tuned something. Declines on an empty band, and
+        declines when the active band plan has nothing on it even if another
+        plan does. Both refusals are the feature: a selector that always
+        produces an answer is worse than no selector, because the operator
+        cannot tell the difference between "found your quad" and "found the
+        noise floor".
+        """
         if self._last_result is None:
-            self._status.showMessage("run a band search first")
-            return
-        best = self.scanner.suggest(self._last_result)
+            if announce:
+                self._status.showMessage("run a band search first")
+            return False
+        best = self.scanner.suggest(self._last_result, self._active_band)
         if best is None:
-            self.banner.set_idle("nothing above the noise floor")
-            self._status.showMessage(
-                "no channel found -- auto-select deliberately declines to "
-                "guess, so an empty band stays empty"
-            )
-            return
+            if self._active_band is not None and self._last_result.decodable:
+                self._status.showMessage(
+                    f"nothing decodable on {self._active_band.label} -- "
+                    f"cleared to search every band"
+                )
+            else:
+                self.banner.set_idle("nothing above the noise floor")
+                if announce:
+                    self._status.showMessage(
+                        "no channel found -- auto-select deliberately declines "
+                        "to guess, so an empty band stays empty"
+                    )
+            return False
         self.freq.blockSignals(True)
         self.freq.setValue(int(round(best.frequency_hz / 1e6)))
         self.freq.blockSignals(False)
-        self._tune(best.frequency_hz, ask_alert=False)
+        self._tune(best.frequency_hz, ask_alert=False, clear_alerts=False)
         self._status.showMessage(f"watching {best.label()}")
+        return True
 
     def _on_cancel(self) -> None:
         if self._scan_thread:
@@ -970,6 +1171,11 @@ class MainWindow(QMainWindow):
                 if self.alerts.active
                 else "idle"
             )
+        if self.autotune.isChecked():
+            # After the alert bookkeeping, not before: _tune() clears the
+            # alert engine, and doing that first would make a brand new finding
+            # look like it had never been raised.
+            self._select_best(announce=False)
 
     def _on_scan_failed(self, message: str) -> None:
         self.scan_btn.setEnabled(True)

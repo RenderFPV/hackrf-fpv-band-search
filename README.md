@@ -130,6 +130,47 @@ correctly reports `noise only` when nothing is transmitting.
    a full field of samples, a sync-lock test, a line-rate measurement.
 4. **Names the channel** from the band chart, and says how sure it is.
 5. **Alerts** when energy appears above the noise floor: banner, beep, log.
+6. **Tunes it for you.** A search that finds something tunes it and shows it,
+   rather than making you press a second button.
+
+## Working the chart
+
+The chart is one row per band plan, and the three gestures on it are:
+
+| Gesture | What it does |
+|---|---|
+| Click a **tick** | Tune that exact channel |
+| Click anywhere else in a **row** | Make that band plan the **active band** |
+| **Shift**-click a row | Sweep that band plan and nothing else |
+| Click **empty space** below the rows | Clear the active band, search everything |
+
+The active band scopes both the search and auto-select, and the scan button
+shows the width it will sweep. That width is the thing that costs time on
+hardware — see *Frequency resolution is the hop size*. Scoping to Raceband's
+eight channels is roughly a fifth of the US region span, so it is the single
+biggest lever on how long a sweep takes.
+
+Scoping is strict on purpose. If you pick Raceband and the strongest signal on
+the band is an F4 from a different plan, auto-select says there is nothing
+rather than handing you someone else's channel — a selector that always
+produces an answer is worse than none, because you cannot tell it apart from
+having found your quad.
+
+## The amplifier
+
+There is an **LNA amp** checkbox beside the LNA gain. A HackRF has no separate
+amp power switch: the LNA is bypassed by asking for 0 dB of LNA gain, which is
+what the checkbox does, and it restores your previous gain when you switch it
+back on.
+
+It is worth having as its own control because the alternative — typing 0 into
+the LNA box — loses your setting and looks like the same control as the VGA.
+Switching it off is how you check whether a strong nearby transmitter is being
+amplified into your own noise floor or is genuinely out there.
+
+It costs a retune, like any change to the LNA gain: the gains are command-line
+arguments to the transfer process, so they can only change when that process is
+replaced. Not a control to flick mid-sweep.
 
 ## The alert
 
@@ -209,6 +250,52 @@ not found (-5)`. That is the normal state, not a fault, and it is retried until
 the device appears. Retrying it matters more than it sounds: unretried, that hop
 reads an empty band because no samples arrived inside the dwell, and the sweep
 silently reports the wrong frequency.
+
+### The retry backoff was most of the sweep
+
+That retry used to wait a flat 350 ms before trying again, and it was charged to
+every hop — 30 hops across the US span is over ten seconds of deliberately
+sitting still. The device is nearly always free within a few milliseconds of
+the outgoing process exiting, and `_kill` has already waited for that exit, so
+the backoff now starts at 15 ms and grows, rather than starting at 350 ms and
+never growing. The ceiling and the attempt count are unchanged, so a radio that
+really is still held gets exactly as much patience as before.
+
+**This has not been re-measured on hardware.** The 12.7 s / 374 ms-per-hop
+figures above predate it. What is measurable without the radio is that the
+simulator still reports 14 ms per hop, and that the sweep now prints its own
+per-hop cost so the number can be read straight off a sweep rather than
+inferred:
+
+```
+scan: scanned 5650 MHz..5950 MHz in 34 hops, 0.5 s, 14 ms/hop: 1 candidate(s)
+```
+
+A sweep that is slow for some reason *other* than retuning will show a
+per-hop figure that does not explain the total, which is the point of printing
+it.
+
+### Reaching one to two seconds is a different problem
+
+Even with the backoff fixed, a per-hop cost dominated by spawning a process
+cannot sweep 300 MHz in one to two seconds: 30 hops at 100 ms is already three
+seconds, and the successful open plus USB latency is most of that 100 ms. The
+options that would actually get there:
+
+- **Scope the sweep** to one band plan. Already possible — click a row on the
+  chart. Raceband is 5725–5865 MHz, about a fifth of the US span, so this is
+  the cheapest real win and it is a control rather than a code change.
+- **Retune in-process.** `hackrf_transfer` cannot; the gains and frequency are
+  command-line arguments. SoapySDR or a libhackrf binding can, and would take a
+  hop to tens of milliseconds. That is a new dependency, and on Windows it means
+  shipping driver DLLs, which is a real cost against "unzip and run".
+- **Widen the coarse hop.** 20 MS/s would halve the hop count, but 20 MS/s is
+  not sustainable on this machine's USB bus, and a short burst that outruns the
+  bus reads an empty hop — which reports a real transmitter as an empty band,
+  the one failure mode that matters most here.
+
+Of those, only the first is available without new dependencies, and it is
+already in the app.
 
 The scan runs on its own thread, so the picture keeps updating while it runs.
 That is not a nicety: on hardware the scan is the only thing taking seconds, and

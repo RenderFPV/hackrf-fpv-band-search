@@ -49,8 +49,24 @@ RING_BYTES = 4 << 20
 #: A retune kills a process that is holding the USB device, and the firmware
 #: refuses a second opener until the first one's handles are gone. So the spawn
 #: after a retune is *expected* to fail once, briefly. These bound the retry.
-OPEN_RETRY_WAIT = 0.35
 OPEN_RETRIES = 14
+
+#: How long to wait for samples from a process that is *alive*. This is a
+#: deadline, not a sleep: the loop returns the instant the first byte lands, so
+#: a generous ceiling costs nothing on a fast open.
+OPEN_ARRIVE_WAIT = 0.35
+
+#: Backoff between a failed open and the next attempt. This was a flat 350 ms,
+#: and that single number was the largest cost in a band sweep: every hop pays
+#: it, because the first spawn after a retune fails *by design*, and at 9 MHz
+#: hops across 300 MHz that is 30 hops x 350 ms = 10.5 s of dead time before a
+#: single sample was analysed. The device is nearly always free within a few
+#: milliseconds of the outgoing process exiting -- ``_kill`` has already waited
+#: for that exit -- so the first retry starts almost immediately and only backs
+#: off if the device is genuinely still busy.
+OPEN_RETRY_MIN = 0.015
+OPEN_RETRY_MAX = 0.35
+OPEN_RETRY_GROWTH = 1.6
 
 #: Where ``hackrf_transfer`` is looked for last, after ``$HACKRF_TRANSFER`` and
 #: the copy beside this program. These are globs rather than fixed paths because
@@ -247,10 +263,23 @@ class SourceStats:
     last_error: str = ""
     running: bool = False
     started_at: float = field(default_factory=time.monotonic)
+    #: Wall clock spent inside retunes, and how many. On hardware this is the
+    #: entire cost of a band sweep -- the samples themselves are 1.6 ms a hop --
+    #: so it is the one number that says whether a sweep is fast, and it is
+    #: reported rather than inferred.
+    tune_total_s: float = 0.0
+    tune_count: int = 0
+    tune_last_ms: float = 0.0
 
     def rate(self, sample_rate: int) -> float:
         el = max(1e-6, time.monotonic() - self.started_at)
         return self.bytes_total / 2.0 / el / sample_rate
+
+    @property
+    def tune_mean_ms(self) -> float:
+        if not self.tune_count:
+            return 0.0
+        return self.tune_total_s * 1000.0 / self.tune_count
 
     def snapshot(self) -> dict:
         return {
@@ -260,6 +289,10 @@ class SourceStats:
             "open_retries": self.open_retries,
             "last_error": self.last_error,
             "running": self.running,
+            "tune_total_s": self.tune_total_s,
+            "tune_count": self.tune_count,
+            "tune_last_ms": self.tune_last_ms,
+            "tune_mean_ms": self.tune_mean_ms,
         }
 
 
@@ -530,7 +563,14 @@ class HackrfSource(IQSource):
         (no device at all, bad arguments, unsupported rate) will not fix itself,
         and a retry loop over those just delays telling the operator what is
         actually wrong.
+
+        The backoff starts at ``OPEN_RETRY_MIN`` and grows, rather than sitting
+        at a flat 350 ms, because the common case is that the device is free
+        within a few milliseconds and a long fixed wait is charged to every hop
+        of a sweep. The ceiling and the attempt count are unchanged, so a device
+        that really is still held gets the same total patience as before.
         """
+        backoff = OPEN_RETRY_MIN
         for _ in range(OPEN_RETRIES):
             if self._stop.is_set():
                 return False
@@ -538,10 +578,11 @@ class HackrfSource(IQSource):
                 self._spawn()
             except Exception as exc:
                 self.stats.last_error = f"spawn failed: {exc}"
-                self._stop.wait(OPEN_RETRY_WAIT)
+                self._stop.wait(backoff)
+                backoff = min(OPEN_RETRY_MAX, backoff * OPEN_RETRY_GROWTH)
                 continue
             base = self.ring.total_written
-            deadline = time.monotonic() + OPEN_RETRY_WAIT
+            deadline = time.monotonic() + OPEN_ARRIVE_WAIT
             while time.monotonic() < deadline:
                 p = self._proc
                 if p is not None and p.poll() is not None:
@@ -561,7 +602,8 @@ class HackrfSource(IQSource):
                 return False
             self.stats.last_error = tail[-300:]
             self.stats.open_retries += 1
-            self._stop.wait(OPEN_RETRY_WAIT)
+            self._stop.wait(backoff)
+            backoff = min(OPEN_RETRY_MAX, backoff * OPEN_RETRY_GROWTH)
         return False
 
     def _kill(self, p: "subprocess.Popen | None" = None) -> None:
@@ -627,11 +669,16 @@ class HackrfSource(IQSource):
         # because two processes opening the same HackRF is a race the firmware
         # resolves badly.
         old, self._proc = self._proc, None
+        t0 = time.monotonic()
         self._kill(old)
         self.stats.restarts += 1
         ok = self._spawn_settled()
         if not ok:
             self._proc = None
+        dt = time.monotonic() - t0
+        self.stats.tune_total_s += dt
+        self.stats.tune_count += 1
+        self.stats.tune_last_ms = dt * 1000.0
         return ok
 
     def _drain_stderr(self, p: "subprocess.Popen") -> None:

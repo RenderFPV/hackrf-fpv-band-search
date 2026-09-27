@@ -243,6 +243,12 @@ class ScanResult:
     def describe(self) -> str:
         span = f"{bands.format_mhz(self.lo_hz)}..{bands.format_mhz(self.hi_hz)}"
         head = f"scanned {span} in {self.hops} hops, {self.elapsed_s:.1f} s"
+        # Report the per-hop cost. On hardware the retune, not the 1.6 ms of
+        # samples, is the whole sweep, so "how long did a sweep take" is not
+        # actionable without "how long did one hop take". A sweep that is slow
+        # for a reason other than retuning should look different here.
+        if self.hops > 1:
+            head += f", {self.elapsed_s / self.hops * 1000.0:.0f} ms/hop"
         if self.error:
             return f"{head}: {self.error}"
         tail = (
@@ -567,10 +573,21 @@ class BandScanner:
             uncertainty_hz=0,      # an explicit request: no hop grid involved
         )
 
-    def suggest(self, result: ScanResult) -> Candidate | None:
+    def suggest(self, result: ScanResult, band: bands.Band | None = None) -> Candidate | None:
         """Auto channel select: the strongest decodable channel, else nothing.
 
         Returning ``None`` when only noise is present is the point. A search that
         always names a channel teaches the operator to ignore it.
+
+        ``band`` scopes the choice to one band plan -- what the operator gets
+        after clicking a row on the chart. Scoping is strict on purpose: someone
+        who picked Raceband to search their own quad does not want to be handed
+        an F4 from a different plan because it scored a decibel higher. If the
+        chosen band genuinely has nothing on it, the answer is still nothing.
         """
-        return result.best()
+        if band is None:
+            return result.best()
+        for cand in result.decodable:
+            if cand.band == band.key:
+                return cand
+        return None
