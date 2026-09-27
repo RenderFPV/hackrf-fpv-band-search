@@ -4,15 +4,31 @@ A malformed workflow is not caught locally by anything else, and it fails on
 GitHub rather than here. This parses the YAML, then checks the things that
 would only fail once the runner is already executing: that every script named
 in a run step exists, that the steps install a requirements file that exists,
-and that the hardware-only tools are not in the gate.
+that no hardware-only tool is in the gate, and that no step containing
+bash-only syntax relies on the default shell on a Windows matrix leg.
+
+It also checks the declared dependencies against what the code actually
+imports, which is not a self-check: it is aimed at the checks, several of which
+used Pillow for years without declaring it.
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - the interesting path
+    sys.stderr.write(
+        "check_workflow.py needs PyYAML to parse the workflow.\n"
+        "It is declared in requirements-dev.txt, not requirements.txt, because\n"
+        "the application does not use it:\n"
+        "\n"
+        "    pip install -r requirements-dev.txt\n"
+    )
+    raise SystemExit(2) from None
 
 ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / ".github" / "workflows" / "checks.yml"
@@ -20,10 +36,14 @@ WF = ROOT / ".github" / "workflows" / "checks.yml"
 #: Tools that need a real HackRF plugged in. They must never be in a run step.
 HARDWARE_ONLY = {"check_hardware_scan", "diag_spurs", "diag_peak_bin"}
 
-#: Import name -> distribution name on PyPI. They differ often enough that
-#: comparing them directly produces a false "undeclared dependency" for PIL,
-#: which is the whole thing this check exists to catch.
-DIST = {"pil": "pillow", "numpy": "numpy", "scipy": "scipy", "pyside6": "pyside6"}
+#: Import name -> distribution name, for the cases where they differ. Anything
+#: not listed is assumed to be its own name in lower case, which is right for
+#: numpy, scipy and pyside6. This map used to be the *whole* check, listing the
+#: four packages that happened to be imported when it was written. That is how
+#: PyYAML got through: it was imported by this file, declared nowhere, and a
+#: list written from memory had no reason to contain it.
+RENAMES = {"pil": "pillow", "yaml": "pyyaml", "cv2": "opencv-python",
+           "sklearn": "scikit-learn", "bs4": "beautifulsoup4", "attr": "attrs"}
 
 #: Constructs that only parse under bash. A windows runner runs `run:` with pwsh
 #: unless the step says `shell: bash`, and a bash loop then dies at *parse* time
@@ -149,14 +169,48 @@ def main() -> int:
             line = line.strip()
             if line and not line.startswith(("#", "-")):
                 declared.add(re.split(r"[><=\[]", line)[0].strip().lower())
-    imported: set[str] = set()
-    for path in list((ROOT / "fpv_rf").glob("*.py")) + list((ROOT / "tools").glob("*.py")) + [ROOT / "main.py"]:
-        for mod in re.findall(r"^\s*(?:import|from)\s+(\w+)", path.read_text(encoding="utf-8"), re.M):
-            if mod.lower() in DIST:
-                imported.add(mod.lower())
+    # Every import in the tree, classified as stdlib, local, or third-party by
+    # asking the interpreter rather than by remembering a list. sys.
+    # stdlib_module_names is the authoritative answer and it grows with Python,
+    # so this does not rot.
+    #
+    # Parsed with ast, not a regex. A regex over `^\s*(import|from)\s+(\w+)`
+    # also matches English: alerts.py's module docstring contains the sentence
+    # "from a drone that was transmitting two minutes ago is itself
+    # information", and that reported a third-party package called `a`.
+    local = {"fpv_rf", "tools", "main", "build_exe"}
+    for path in (ROOT / "tools").glob("*.py"):
+        local.add(path.stem)
+    third_party: dict[str, set[str]] = {}
+    sources = (list((ROOT / "fpv_rf").glob("*.py"))
+               + list((ROOT / "tools").glob("*.py"))
+               + [ROOT / "main.py", ROOT / "build_exe.py"])
+    for path in sources:
+        rel = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        mods: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                # level > 0 is a relative import, i.e. this repository's own code
+                if node.level == 0 and node.module:
+                    mods.add(node.module.split(".")[0])
+        for mod in mods:
+            low = mod.lower()
+            if low in sys.stdlib_module_names or low in local or low == "__future__":
+                continue
+            third_party.setdefault(low, set()).add(rel)
+    imported = sorted(third_party)
     print(f"\n  declared  : {sorted(declared)}")
-    print(f"  imported  : {sorted(imported)}")
-    undeclared = {DIST[m] for m in imported} - declared
+    print(f"  imported  : {imported}")
+    for mod in imported:
+        users = sorted(third_party[mod])
+        shown = ", ".join(users[:3]) + (f" (+{len(users)-3} more)" if len(users) > 3 else "")
+        dist = RENAMES.get(mod, mod)
+        mark = "ok      " if dist in declared else "PROBLEM "
+        print(f"    {mark} {mod:<10} -> {dist:<10} {shown}")
+    undeclared = {RENAMES.get(m, m) for m in imported} - declared
     if undeclared:
         problems.append(f"imported but undeclared in any requirements file: {sorted(undeclared)}")
     else:

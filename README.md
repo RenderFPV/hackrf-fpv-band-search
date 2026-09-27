@@ -26,7 +26,7 @@ That is three packages — numpy, scipy, PySide6 — and it is deliberately all 
 `scipy.ndimage.zoom` rather than a resize, so the packaged `.exe` does not carry
 an imaging library it would not otherwise use.
 
-To run the checks as well, which need one more:
+To run the checks as well, which need two more:
 
 ```
 pip install -r requirements-dev.txt
@@ -34,6 +34,8 @@ pip install -r requirements-dev.txt
 
 Five scripts under `tools/` use Pillow, and only to write a PNG of a decoded
 frame so a human can look at it. Nothing in the decode path touches it.
+`check_workflow.py` uses PyYAML to parse the CI workflow before pushing it.
+Both are development-only, and neither reaches the packaged `.exe`.
 
 ## The .exe app
 

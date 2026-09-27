@@ -11,7 +11,16 @@
 # It was previously undeclared and merely happened to be installed on the
 # machine that developed this, so a fresh clone would have failed on the first
 # check that saved a frame. CI installs this file for exactly that reason.
+#
+# PyYAML is needed by one script, check_workflow.py, which parses
+# .github/workflows/checks.yml so the workflow can be validated before it is
+# pushed. That script made the same mistake with this package that the others
+# made with Pillow: it was installed ad hoc on the development machine and
+# declared nowhere, and the first CI run failed with ModuleNotFoundError on
+# both legs. The import is guarded so the message says what to install rather
+# than printing a traceback.
 
 -r requirements.txt
 
 Pillow>=10.0
+PyYAML>=6.0
