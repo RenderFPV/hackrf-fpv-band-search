@@ -39,6 +39,17 @@ Both are development-only, and neither reaches the packaged `.exe`.
 
 ## The .exe app
 
+**You do not need to build this.** Download it from the
+[v1.0.0 release](https://github.com/RenderFPV/hackrf-fpv-band-search/releases/tag/v1.0.0)
+— `FPV-RF-v1.0.0-windows-x64.zip`, 87 MB — extract it, and double-click
+`FPV-RF.exe`. No Python, no pip, no drivers. The first launch takes about
+fifteen seconds while Windows Defender scans the freshly-extracted files; the
+second takes about one. Windows will warn you the app is unsigned; that is the
+missing signature, not the program, and *More info → Run anyway* is the correct
+response.
+
+To build it yourself instead:
+
 ```
 python build_exe.py
 ```
@@ -290,6 +301,7 @@ picture that is actually a different picture every frame.
 ```
 main.py                 argument parsing, source selection, --check, logging
 build_exe.py            package the app as a double-clickable .exe
+tools/make_release.py   zip the build, checksum it, attach it to a release
 fpv_rf/dsp.py           demod, de-emphasis, sync, rasteriser, classification
 fpv_rf/bands.py         the band plans, frequency -> band/channel, legality
 fpv_rf/sdr.py           sources: hackrf_transfer, file replay, simulator
@@ -302,6 +314,17 @@ tools/_paths.py         resolves the optional real capture, no hardcoded paths
 tools/check_workflow.py validates .github/workflows/checks.yml before pushing
 tools/archive/          development scaffolding; nothing runs it automatically
 docs/                   the screenshots this README shows
+docs/releases/          release notes, versioned alongside the code
+```
+
+The 212 MB build is deliberately **not** in git. A binary that size would be
+fetched on every clone forever and cannot be reviewed in a diff, so the source
+lives here and the build is published as a release asset.
+
+```
+python build_exe.py              # build, and verify the build
+python tools\make_release.py --dry-run   # zip + checksum, publish nothing
+python tools\make_release.py --tag v1.0.0  # zip, checksum, attach to a release
 ```
 
 ## Checks
