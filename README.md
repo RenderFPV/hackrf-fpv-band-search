@@ -145,10 +145,21 @@ The chart is one row per band plan, and the three gestures on it are:
 | Click **empty space** below the rows | Clear the active band, search everything |
 
 The active band scopes both the search and auto-select, and the scan button
-shows the width it will sweep. That width is the thing that costs time on
-hardware — see *Frequency resolution is the hop size*. Scoping to Raceband's
-eight channels is roughly a fifth of the US region span, so it is the single
-biggest lever on how long a sweep takes.
+shows the width it will sweep. Scoping to Raceband's eight channels is roughly a
+fifth of the US region span.
+
+Two controls sit beside the scan button, and both exist because of how the two
+search engines differ:
+
+- **passes** (1, 4 or 10) is how many sweeps to combine, and it only applies to
+  the sweep engine. One is the default, because FPV video transmits continuously
+  and one pass sees it as well as ten. See *Passes* for when more is worth it,
+  and for why the combine is a maximum rather than an average.
+- **The engine is not a choice.** The app uses the fast sweep when it can get
+  the radio and falls back to the hop walk when it cannot, and the status line
+  says which one answered. The `hop` control next to the chart only applies to
+  the hop walk, and its tooltip says so rather than leaving you to wonder why it
+  did nothing.
 
 Scoping is strict on purpose. If you pick Raceband and the strongest signal on
 the band is an F4 from a different plan, auto-select says there is nothing
@@ -277,9 +288,15 @@ tolerance. That is the difference between replaying a recording and sweeping.
 
 `hackrf_transfer` has no in-process retune, so every hop is: kill the process,
 start a new one, wait for the tuner to settle. A measured 34-hop sweep of the US
-span takes **12.7 s** — 374 ms per hop, nearly all of it the retune. Budget for
-that, and for a minute or so on the 2 MHz grid. The sim source retunes
-instantly, which is why the scan in the screenshot above reports 0.6 s.
+span takes **12.5 s** - 367 ms per hop, nearly all of it the retune. Budget for
+that if you are on this path, and for a minute or so on the 2 MHz grid. The sim
+source retunes instantly, which is why the scan in the screenshot above reports
+0.6 s.
+
+This is the engine's worst property, and it is what the next section is about.
+The cost is in re-opening the USB device, so it is not a cost that cleverer
+Python can reduce. There is another tool that does not pay it, and the app uses
+that one whenever it can.
 
 Terminating the old process does *not* wait for it to release the USB device, so
 the first spawn after a retune fails outright with `hackrf_open() failed: HackRF
@@ -298,10 +315,13 @@ the backoff now starts at 15 ms and grows, rather than starting at 350 ms and
 never growing. The ceiling and the attempt count are unchanged, so a radio that
 really is still held gets exactly as much patience as before.
 
-**This has not been re-measured on hardware.** The 12.7 s / 374 ms-per-hop
-figures above predate it. What is measurable without the radio is that the
-simulator still reports 14 ms per hop, and that the sweep now prints its own
-per-hop cost so the number can be read straight off a sweep rather than
+**Re-measured on hardware since.** The hop walk takes 12.5 s for the US
+span, 367 ms per hop, so the backoff change bought about 0.2 s out of a figure
+still dominated by the USB re-open. On a *degraded* USB bus the same walk takes
+68 s, 2006 ms per hop, which is worth knowing: the cost is the device being
+asked to do something, so it moves with the device's mood. The simulator reports
+14 ms per hop because there is no device to re-open, and the sweep prints its
+own per-hop cost so the number can be read straight off a sweep rather than
 inferred:
 
 ```
@@ -312,27 +332,97 @@ A sweep that is slow for some reason *other* than retuning will show a
 per-hop figure that does not explain the total, which is the point of printing
 it.
 
-### Reaching one to two seconds is a different problem
+### And the answer: don't retune at all
 
-Even with the backoff fixed, a per-hop cost dominated by spawning a process
-cannot sweep 300 MHz in one to two seconds: 30 hops at 100 ms is already three
-seconds, and the successful open plus USB latency is most of that 100 ms. The
-options that would actually get there:
+Everything above assumes the scan has to re-open the device to move frequency.
+The Mayhem bundle ships another tool that does not work that way:
+`hackrf_sweep` keeps the radio open across a whole sweep and retunes it with a
+control transfer, so a hop costs about a millisecond instead of 367.
 
-- **Scope the sweep** to one band plan. Already possible — click a row on the
-  chart. Raceband is 5725–5865 MHz, about a fifth of the US span, so this is
-  the cheapest real win and it is a control rather than a code change.
-- **Retune in-process.** `hackrf_transfer` cannot; the gains and frequency are
-  command-line arguments. SoapySDR or a libhackrf binding can, and would take a
-  hop to tens of milliseconds. That is a new dependency, and on Windows it means
-  shipping driver DLLs, which is a real cost against "unzip and run".
-- **Widen the coarse hop.** 20 MS/s would halve the hop count, but 20 MS/s is
-  not sustainable on this machine's USB bus, and a short burst that outruns the
-  bus reads an empty hop — which reports a real transmitter as an empty band,
-  the one failure mode that matters most here.
+It is used when it is available, and the difference is not marginal. The same
+5650-5950 MHz span:
 
-Of those, only the first is available without new dependencies, and it is
-already in the app.
+| engine | span | time | what it can tell you |
+| --- | --- | --- | --- |
+| `hackrf_sweep` | 5640-5960 MHz, 320 bins | **0.14 s** | energy, 1 MHz bins |
+| hop walk | 5650-5950 MHz, 34 hops | 12.5 s | energy, and whether the signal decodes as video |
+
+`fpv_rf/sweep.py` is the engine and `fpv_rf/fastscan.py` chooses between them. A
+sweep cannot tell you a signal is decodable analogue video: it measures energy
+and never looks at a line rate. So `ScanResult` records which engine answered and
+the app says so, rather than letting a coarse answer be read as a precise one.
+That is also why the hop walk is kept rather than replaced.
+
+It needs one thing the app cannot assume: `libfftw3f-3.dll`, which the Mayhem
+bundle does not ship, and without which the tool exits with
+`STATUS_DLL_NOT_FOUND` and no output at all. `find_fftw()` looks for a
+single-precision FFTW on the machine and **verifies it by reading the PE export
+table**. A double-precision build has the same file name and none of the `fftwf_`
+symbols, so finding a file is not the same as finding the right one. What it
+finds is copied to `%LOCALAPPDATA%/FPV-RF/sweep-tool/`; the source directory is
+only ever read. FFTW is GPL, which is why it is staged at runtime rather than
+committed to this MIT repository.
+
+### Why it does not always win, and what happens when it cannot
+
+Handing the radio to `hackrf_sweep` means stopping a `hackrf_transfer` that is
+mid-transfer. On a HackRF One that leaves the device refusing the next open for
+a period that is not predictable: measured here from 0 s to over 30 s, not fixed
+by waiting longer, and not fixed by stopping politely, because the tool ignores
+Ctrl-C and has to be killed. `tools/probe_handover.py` reproduces it: five
+handovers out of five fail with the raw sample stream running, three out of
+three succeed without it.
+
+So the app tries the sweep, gives it a bounded wait, and **falls back to the hop
+walk when the tool cannot have the radio**. The fast path is usually fast; the
+answer is always real and always arrives, and the status line says which engine
+ran and why. The wait is bounded because a scan that hangs for a minute is
+indistinguishable from a broken app.
+
+A search that failed is never reported as a quiet band. An exit-0 sweep that
+produced no parseable data used to report "nothing above the noise floor", which
+reads as a claim about the band when in fact nothing was measured. That is the
+one failure mode worth being pedantic about, since the whole value of a scan is
+that its silence means something.
+
+### Passes
+
+The `passes` control sets how many sweeps to combine: 1, 4 or 10. One is the
+default and it is the right answer for FPV, because the video link transmits
+continuously, so one pass sees it as well as ten would, at 0.15 s against 0.53 s.
+
+More passes only help against a transmitter that is *intermittent*. The combine
+statistic is the **max** across passes, not the mean, and that is not a
+preference: three consecutive single-pass scans of the 2.4 GHz band showed
+spreads of 13, 42 and 15 dB, with one pass catching a real WiFi signal at
++42 dB that the other two missed entirely. Averaging a burst seen in one pass out
+of three divides its amplitude by three and hides it.
+
+The max-of-N runs high on pure noise, so the gate is priced for it,
+`4.34 * log10(N)` dB, because otherwise sweeping ten times would raise every bin
+about 4.3 dB and manufacture findings out of an empty band. That is exactly how
+a scan whose job is to prove a band is quiet ends up reporting transmitters in
+it.
+
+### What a sweep counts as a transmitter
+
+Detection runs on a **15 MHz window** rather than on raw 1 MHz bins, because
+adjacent bins come from one FFT and are strongly correlated: a lone bin that
+happens to land high looks as significant as its distance above the floor
+suggests, and a 1 MHz "signal" is not a 25 MHz VTX. The window matches
+`scan.VTX_WIDTH_HZ`, and it responds properly to a real signal whose skirts are
+weaker than its centre.
+
+The gate is 14 dB over the floor, set from the two numbers that bound it rather
+than tuned until a test passed. The widest excursion a genuinely empty band has
+produced on this machine is +8.8 dB, and a real transmitter measures +29 dB in
+the same window, +40 dB when a burst lands in the pass being read. Anything below
+about 11 dB reports phantom transmitters on a degraded bus, and a pilot cannot
+tell a phantom from a real one.
+
+`tools/check_sweep.py` checks this against hardware, using 2.4 GHz as the
+known-answer band because it has traffic in it and 5.8 GHz does not. A scanner
+that reports transmitters in an empty band is worse than no scanner.
 
 The scan runs on its own thread, so the picture keeps updating while it runs.
 That is not a nicety: on hardware the scan is the only thing taking seconds, and
@@ -378,6 +468,16 @@ band empty:
 scanned 5650 MHz..5950 MHz in 34 hops, 12.7 s: nothing above the noise floor
   (loudest quiet hop peaked 5.2 dB over it, gate 12 dB)
 candidates: 0, false positives: 0
+```
+
+The block above is the hop walk, captured as it ran. The sweep engine has its
+own equivalent, and it is the one that matters now, because 34 hops in 12.7 s is
+not the number an operator waits for:
+
+```
+swept 5640 MHz..5960 MHz in 320 bins, 0.14 s: nothing above the noise floor
+  (loudest quiet bin peaked 0.0 dB over it, gate 12 dB)
+```
 ```
 
 ## What the sim is and is not
@@ -430,12 +530,17 @@ fpv_rf/dsp.py           demod, de-emphasis, sync, rasteriser, classification
 fpv_rf/bands.py         the band plans, frequency -> band/channel, legality
 fpv_rf/sdr.py           sources: hackrf_transfer, file replay, simulator
 fpv_rf/video.py         frame assembly and the decode thread
-fpv_rf/scan.py          two-pass band search, merging, auto-select
+fpv_rf/scan.py          the hop-walk search, merging, auto-select
+fpv_rf/sweep.py         the fast sweep engine: tool, FFTW, trace, detection
+fpv_rf/fastscan.py      picks an engine, and hands the radio over and back
 fpv_rf/alerts.py        identity, dedupe, cooldown, log, beep
 fpv_rf/ui.py            PySide6 window, band chart widget, alert panel
 tools/                  the checks below
 tools/_paths.py         resolves the optional real capture, no hardcoded paths
 tools/check_workflow.py validates .github/workflows/checks.yml before pushing
+tools/check_sweep.py    the sweep engine, on hardware (needs a HackRF)
+tools/check_fastscan.py the engine choice and the radio handover
+tools/probe_handover.py why the handover is unreliable; wedges the radio on purpose
 tools/archive/          development scaffolding; nothing runs it automatically
 docs/                   the screenshots this README shows
 docs/releases/          release notes, versioned alongside the code
