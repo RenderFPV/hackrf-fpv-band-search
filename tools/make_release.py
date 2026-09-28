@@ -99,6 +99,15 @@ def main() -> int:
         print("The app looks for it beside the executable before PATH, so a build")
         print("without it silently falls back to whatever else is installed.")
         return 2
+    if not (DIST / "hackrf_sweep.exe").exists():
+        # Same reasoning, and the reason this is a gate rather than a warning: a
+        # build without the sweep tool still works, searches 5650-5950 MHz in
+        # 12.5 s instead of 0.14 s, and reports nothing wrong. Publishing that
+        # as a release is how a fast feature ships looking absent.
+        print("hackrf_sweep.exe is missing from the build.")
+        print("Without it every user gets the 12.5 s hop walk and no way to know")
+        print("why. The app is not broken, which is the problem: it is quietly slow.")
+        return 2
 
     RELEASES.mkdir(parents=True, exist_ok=True)
     tag = args.tag or "v0.0.0-dev"

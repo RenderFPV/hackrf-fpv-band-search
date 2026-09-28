@@ -40,8 +40,8 @@ Both are development-only, and neither reaches the packaged `.exe`.
 ## The .exe app
 
 **You do not need to build this.** Download it from the
-[v1.0.0 release](https://github.com/RenderFPV/hackrf-fpv-band-search/releases/tag/v1.0.0)
-— `FPV-RF-v1.0.0-windows-x64.zip`, 87 MB — extract it, and double-click
+[v1.0.1 release](https://github.com/RenderFPV/hackrf-fpv-band-search/releases/tag/v1.0.1)
+- `FPV-RF-v1.0.1-windows-x64.zip`, 88 MB - extract it, and double-click
 `FPV-RF.exe`. No Python, no pip, no drivers. The first launch takes about
 fifteen seconds while Windows Defender scans the freshly-extracted files; the
 second takes about one. Windows will warn you the app is unsigned; that is the
@@ -553,7 +553,7 @@ lives here and the build is published as a release asset.
 ```
 python build_exe.py              # build, and verify the build
 python tools\make_release.py --dry-run   # zip + checksum, publish nothing
-python tools\make_release.py --tag v1.0.0  # zip, checksum, attach to a release
+python tools\make_release.py --tag v1.0.1  # zip, checksum, attach to a release
 ```
 
 ## Checks
