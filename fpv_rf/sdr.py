@@ -419,6 +419,23 @@ class IQSource(ABC):
     def _teardown(self) -> None:
         pass
 
+    #: True when another process can be given sole use of the radio while this
+    #: source stands aside. Only a real radio can be handed over; a file or a
+    #: simulator has no device to give away.
+    exclusive_use = False
+
+    def release_device(self) -> bool:
+        """Give up whatever hardware this source holds, keeping the thread up.
+
+        A no-op returning True by default, because most sources hold nothing
+        exclusive and there is nothing to fail at.
+        """
+        return True
+
+    def reclaim_device(self) -> bool:
+        """Take hardware back after :meth:`release_device`. Always True here."""
+        return True
+
     @abstractmethod
     def _run(self) -> None:
         ...
@@ -535,6 +552,9 @@ class HackrfSource(IQSource):
         self.executable = executable or find_hackrf_transfer()
         self._proc: subprocess.Popen | None = None
         self._err_thread: threading.Thread | None = None
+        #: True while the radio has been handed to another process. See
+        #: :meth:`release_device`.
+        self._released = False
         self._block = bytearray(1 << 22)   # 4 MiB; readinto needs a fixed buffer
         self._view = memoryview(self._block)
         self._stderr_tail: list[str] = []
@@ -698,6 +718,13 @@ class HackrfSource(IQSource):
                 p.kill()
             except Exception:
                 pass
+            # Wait for the kill too. Skipping this and returning straight away
+            # leaves a process that is still shutting down -- holding its USB
+            # handles, and about to be told by the caller that the radio is free.
+            try:
+                p.wait(timeout=1.5)
+            except Exception:
+                pass
 
     @staticmethod
     def _close_quietly(stream) -> None:
@@ -710,6 +737,82 @@ class HackrfSource(IQSource):
     def _teardown(self) -> None:
         self._kill()
 
+    #: A real radio is the one thing here another process can be handed.
+    exclusive_use = True
+
+    def release_device(self) -> bool:
+        """Free the radio so another process can open it.
+
+        The sampling thread is left running on purpose. It is what makes this
+        cheap -- it is the thread that owns the pipe handles, and it is the
+        thread that has to be there to read the EOF that killing the transfer
+        process produces. What it must not do is reopen the device, or it would
+        take the radio straight back out of the other process's hands.
+
+        So the thread is told to stand down, not shut up. :attr:`_released` is
+        checked in the respawn branch of :meth:`_run`; without it that branch
+        reopens the device about 20 ms after this returns, which is precisely
+        long enough to lose the race every time.
+
+        Note what a successful return does and does not promise. It means *this*
+        process has let go, which is the part the caller can act on. It does not
+        promise the next process will get in: stopping a ``hackrf_transfer``
+        that is streaming with ``-r -`` leaves the device refusing new opens for
+        an unpredictable period, and nothing done here can shorten that. The
+        sweep path deals with it by falling back rather than by waiting -- see
+        ``fpv_rf/fastscan.py``, and ``tools/probe_handover.py`` for the
+        measurement behind that.
+
+        Returns whether this process has let the radio go. False means it
+        is still holding it, and the caller must not start another process
+        on the radio as though it were not.
+        """
+        with self._tune_lock:
+            self._released = True
+            old, self._proc = self._proc, None
+            self._kill(old)
+        if old is None:
+            return True
+        # Wait for *that* process to actually be gone, and for the device to
+        # settle. The wait has to name the process this released: ``self._proc``
+        # was cleared above on purpose, so waiting on it would return instantly
+        # and say the radio was free while the transfer process was still
+        # shutting down and still holding its USB handles. That is not a
+        # hypothetical -- it is what left ``hackrf_sweep`` blocked forever
+        # waiting for a device the previous process had not given up yet, and
+        # the scan it was part of reported a 90-second stall instead of a fast
+        # answer.
+        deadline = time.monotonic() + 5.0
+        while old.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if old.poll() is not None:
+            # A terminated process still has its USB handles closing, and the
+            # next process to ask for the radio inside that window is refused.
+            time.sleep(0.15)
+            return True
+        # Still alive after being terminated *and* killed. Report the truth: the
+        # radio is not free, and starting the other tool now would be a race
+        # that a caller cannot win.
+        return False
+
+    def reclaim_device(self) -> bool:
+        """Reopen the radio at whatever frequency is current, and resume.
+
+        Returns whether the device came back. A false here means the radio is
+        gone, which the caller should surface rather than paper over: the
+        operator is now watching a still picture and would have no idea why.
+        """
+        with self._tune_lock:
+            self._released = False
+            if self._proc is not None:
+                return True
+            if not self._thread:
+                return True
+            ok = self._spawn_settled()
+            if not ok:
+                self._proc = None
+            return ok
+
     def _apply_tune(self) -> bool:
         """Swap in a transfer process at the new frequency.
 
@@ -717,6 +820,12 @@ class HackrfSource(IQSource):
         docstring for why this must not take it again.
         """
         if not self._thread:
+            return True
+        if self._released:
+            # The device belongs to another process. The new frequency is
+            # already recorded -- tune() sets it before calling here -- so
+            # reclaim_device() will open at the right place. Spawning now would
+            # take the radio out from under whoever was lent it.
             return True
         # Detach the *current* process by name. The reader may be blocked in
         # readinto() on it and will clean up after itself; all this side owes the
@@ -802,6 +911,13 @@ class HackrfSource(IQSource):
             if p is None and self._proc is None:
                 if self._stop.is_set():
                     break
+                if self._released:
+                    # The radio is in another process's hands on purpose. Idle
+                    # rather than reopen it -- see release_device(). The thread
+                    # stays up so it is there to read the EOF and the samples
+                    # when reclaim_device() puts the device back.
+                    self._stop.wait(0.05)
+                    continue
                 # Nothing is running and nobody else is starting anything: the
                 # device was unplugged, or the process died on its own. Take the
                 # lock so this cannot overlap a retune's spawn.

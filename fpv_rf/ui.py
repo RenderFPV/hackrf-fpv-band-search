@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import alerts, bands, dsp, scan
+from . import alerts, bands, dsp, fastscan, scan
 from .sdr import DEFAULT_SAMPLE_RATE, IQSource, make_source
 from .video import DecodeWorker, VideoFrame
 
@@ -608,6 +608,12 @@ class ScanThread(QThread):
     tens of them, so this is seconds of work. Doing it on the GUI thread would
     stop the repaints, and with them the picture -- which is the thing the
     operator is looking at while they wait.
+
+    Which engine does the work is :mod:`fpv_rf.fastscan`'s decision, not this
+    class's: the sweep tool is about a hundred times faster where it exists and
+    is the only way to get a whole-band search into a fraction of a second, and
+    the hop walk is the fallback. Both return the same type, so everything
+    downstream of here is identical either way.
     """
 
     progress = Signal(str, float)
@@ -615,24 +621,37 @@ class ScanThread(QThread):
     failed = Signal(str)
 
     def __init__(self, source: IQSource, lo_hz: int, hi_hz: int,
-                 hop_frac: float, parent: QObject | None = None) -> None:
+                 hop_frac: float, sweeps: int = 1,
+                 parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.source = source
         self.lo_hz, self.hi_hz = int(lo_hz), int(hi_hz)
         self.hop_frac = float(hop_frac)
-        self._scanner = scan.BandScanner(source, hop_frac=self.hop_frac)
+        self.sweeps = max(1, int(sweeps))
+        self._cancel = threading.Event()
 
     def cancel(self) -> None:
-        self._scanner.cancel()
+        self._cancel.set()
 
     def run(self) -> None:  # noqa: D102
         try:
-            res = self._scanner.scan(
-                lo_hz=self.lo_hz, hi_hz=self.hi_hz,
+            res = fastscan.scan_span(
+                self.source, self.lo_hz, self.hi_hz,
+                hop_frac=self.hop_frac, sweeps=self.sweeps,
+                lna_db=getattr(self.source, "lna_gain_db", 32),
+                vga_db=getattr(self.source, "vga_gain_db", 16),
+                amp=bool(getattr(self.source, "amp_enabled", True)),
+                cancel=self._cancel,
                 progress=lambda m, f: self.progress.emit(m, f),
             )
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        if res.error and not res.candidates and res.engine == "sweep":
+            # A sweep that could not run is a failure, not an empty band. Saying
+            # "nothing above the noise floor" about a scan that never happened
+            # is the one answer that must never come out of this.
+            self.failed.emit(res.error)
             return
         self.finished_ok.emit(res)
 
@@ -818,19 +837,40 @@ class MainWindow(QMainWindow):
             "The grid sets how precisely a transmitter's frequency is known:\n"
             "a 9 MHz grid pins it to +-4.5 MHz, a 2 MHz grid to +-1 MHz.\n"
             "Finer costs proportionally more sweeps -- and on real hardware,\n"
-            "one tuner settling period per hop."
+            "one tuner settling period per hop.\n\n"
+            "This only applies to the hop-by-hop engine. The sweep engine\n"
+            "always resolves to 1 MHz bins and ignores this."
         )
         gv.addWidget(QLabel("grid"), 1, 0, 1, 2)
         gv.addWidget(self.hop, 1, 2)
 
+        self.sweeps = QComboBox()
+        self.sweeps.addItem("1 pass", 1)
+        self.sweeps.addItem("4 passes", 4)
+        self.sweeps.addItem("10 passes", 10)
+        self.sweeps.setCurrentIndex(0)
+        self.sweeps.setToolTip(
+            "How many times to sweep the band and keep the loudest reading.\n\n"
+            "One pass is right for FPV video, which transmits continuously and\n"
+            "is therefore caught every time -- a whole-band pass takes about a\n"
+            "fifth of a second, so a second pass is only worth having for a\n"
+            "transmitter that comes and goes, such as a beaconing access point.\n\n"
+            "More passes never find a weaker signal, only one that was not\n"
+            "transmitting at the moment. The strongest reading is kept, not the\n"
+            "average, so a pass that caught a burst is not diluted by the quiet\n"
+            "ones around it."
+        )
+        gv.addWidget(QLabel("passes"), 2, 0, 1, 2)
+        gv.addWidget(self.sweeps, 2, 2)
+
         self.scan_btn = QPushButton("Scan band")
         self.scan_btn.setDefault(True)
         self.scan_btn.setToolTip(
-            "Sweep the whole search span at a coarse grid and report every "
-            "frequency with energy above the noise floor."
+            "Sweep the whole search span and report every frequency with "
+            "energy above the noise floor."
         )
         self.scan_btn.clicked.connect(self._on_scan)
-        gv.addWidget(self.scan_btn, 2, 0, 1, 3)
+        gv.addWidget(self.scan_btn, 3, 0, 1, 3)
         self.auto_btn = QPushButton("Auto-select")
         self.auto_btn.setToolTip(
             "Tune the strongest decodable channel from the last search and "
@@ -839,14 +879,14 @@ class MainWindow(QMainWindow):
             "ignore it."
         )
         self.auto_btn.clicked.connect(self._on_auto)
-        gv.addWidget(self.auto_btn, 3, 0, 1, 2)
+        gv.addWidget(self.auto_btn, 4, 0, 1, 2)
         self.cancel_btn = QPushButton("Stop")
         self.cancel_btn.setToolTip("Stop the running search. A stopped search "
                                    "reports nothing, rather than reporting that "
                                    "everything it did not reach has gone.")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._on_cancel)
-        gv.addWidget(self.cancel_btn, 3, 2)
+        gv.addWidget(self.cancel_btn, 4, 2)
 
         self.autotune = QCheckBox("tune it automatically")
         self.autotune.setChecked(True)
@@ -857,13 +897,13 @@ class MainWindow(QMainWindow):
             "when the active band has nothing on it. Finding a signal and\n"
             "watching it are one action, not two."
         )
-        gv.addWidget(self.autotune, 4, 0, 1, 3)
+        gv.addWidget(self.autotune, 5, 0, 1, 3)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
-        gv.addWidget(self.progress, 5, 0, 1, 3)
+        gv.addWidget(self.progress, 6, 0, 1, 3)
         v.addWidget(g)
 
         # -- display -----------------------------------------------------
@@ -1152,14 +1192,21 @@ class MainWindow(QMainWindow):
         # cooldown and the seen-count is that the second sweep over the same
         # drone says "already known" instead of raising an identical alert; the
         # history has to survive the sweep that follows the one that found it.
-        th = ScanThread(self.source, lo_hz, hi_hz, self.hop.currentData(), self)
+        th = ScanThread(self.source, lo_hz, hi_hz, self.hop.currentData(),
+                        sweeps=self.sweeps.currentData(), parent=self)
         th.progress.connect(self._on_progress)
         th.finished_ok.connect(self._on_scan_done)
         th.failed.connect(self._on_scan_failed)
         self._scan_thread = th
         th.start()
+        # Say which engine answered, before it answers, when it is knowable.
+        # An operator timing a scan needs to know whether 0.2 s means "fast" or
+        # "did not run", and the difference is not visible in the result.
+        engine = ("sweep" if fastscan.fast_ok(self.source)
+                  else f"hop-by-hop ({fastscan.why_not_fast(self.source)})")
         self._status.showMessage(
-            f"sweeping {bands.format_mhz(lo_hz)}-{bands.format_mhz(hi_hz)}..."
+            f"sweeping {bands.format_mhz(lo_hz)}-{bands.format_mhz(hi_hz)} "
+            f"using the {engine} engine"
         )
 
     def _on_progress(self, message: str, frac: float) -> None:

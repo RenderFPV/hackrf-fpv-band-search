@@ -207,6 +207,14 @@ class ScanResult:
     noise_floor_db: float = -120.0
     stopped_early: bool = False
     error: str = ""
+    #: Which measurement produced this, for the operator's benefit. "sweep" is
+    #: the fast path, where the radio stays open and retunes by control
+    #: transfer; "hops" is the original walk, where each hop reopens the USB
+    #: device. The two are not interchangeable in their numbers -- a sweep
+    #: resolves to 1 MHz bins and cannot say whether a signal is video, where a
+    #: hop reads a full video field and can -- so a result that does not say
+    #: which it is would invite reading a coarse answer as a precise one.
+    engine: str = "hops"
 
     @property
     def occupied(self) -> list[Candidate]:
@@ -242,13 +250,19 @@ class ScanResult:
 
     def describe(self) -> str:
         span = f"{bands.format_mhz(self.lo_hz)}..{bands.format_mhz(self.hi_hz)}"
-        head = f"scanned {span} in {self.hops} hops, {self.elapsed_s:.1f} s"
-        # Report the per-hop cost. On hardware the retune, not the 1.6 ms of
-        # samples, is the whole sweep, so "how long did a sweep take" is not
-        # actionable without "how long did one hop take". A sweep that is slow
-        # for a reason other than retuning should look different here.
-        if self.hops > 1:
-            head += f", {self.elapsed_s / self.hops * 1000.0:.0f} ms/hop"
+        if self.engine == "sweep":
+            # A sweep's unit is a frequency bin, not a hop, so "ms/hop" would be
+            # nonsense here -- there are no hops, and the cost per unit says
+            # nothing useful about where the time went.
+            head = f"swept {span} in {self.hops} bins, {self.elapsed_s:.2f} s"
+        else:
+            head = f"scanned {span} in {self.hops} hops, {self.elapsed_s:.1f} s"
+            # Report the per-hop cost. On hardware the retune, not the 1.6 ms of
+            # samples, is the whole sweep, so "how long did a sweep take" is not
+            # actionable without "how long did one hop take". A sweep that is
+            # slow for a reason other than retuning should look different here.
+            if self.hops > 1:
+                head += f", {self.elapsed_s / self.hops * 1000.0:.0f} ms/hop"
         if self.error:
             return f"{head}: {self.error}"
         tail = (
@@ -258,12 +272,17 @@ class ScanResult:
         if not self.candidates:
             return (
                 f"{head}: nothing above the noise floor{tail} "
-                f"(loudest quiet hop peaked {self.peak_noise_db:.1f} dB over it, "
+                f"(loudest quiet {self._unit} peaked "
+                f"{self.peak_noise_db:.1f} dB over it, "
                 f"gate {self.gate_peak_db:.0f} dB)"
             )
         best = self.best()
         got = f" -- best {best.describe()}" if best else ""
         return f"{head}: {len(self.candidates)} candidate(s){got}{tail}"
+
+    @property
+    def _unit(self) -> str:
+        return "bin" if self.engine == "sweep" else "hop"
 
 
 class BandScanner:
