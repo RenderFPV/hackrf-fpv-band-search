@@ -593,7 +593,7 @@ class BandScanner:
         )
 
     def suggest(self, result: ScanResult, band: bands.Band | None = None) -> Candidate | None:
-        """Auto channel select: the strongest decodable channel, else nothing.
+        """Auto channel select: the strongest occupied channel, else nothing.
 
         Returning ``None`` when only noise is present is the point. A search that
         always names a channel teaches the operator to ignore it.
@@ -603,10 +603,36 @@ class BandScanner:
         who picked Raceband to search their own quad does not want to be handed
         an F4 from a different plan because it scored a decibel higher. If the
         chosen band genuinely has nothing on it, the answer is still nothing.
+
+        Two things this gets right that the obvious version does not.
+
+        The occupancy bar is the same either way. It used to be
+        ``result.best()`` with no band and ``result.decodable`` with one, so the
+        identical result was selected when no band was active and rejected when
+        one was. That difference fell precisely on fast sweeps, which measure
+        energy and can never call a signal VIDEO: a Raceband sweep that plainly
+        detected a Raceband channel refused to select it, and only because the
+        operator had scoped the search. The asymmetry was not a design choice;
+        it was a filter that was added to one branch and not the other.
+
+        Membership is decided by frequency, not by a band label. Plans share
+        channels -- Raceband R7 and F8 are both 5880 MHz -- and
+        ``match_frequency`` returns whichever plan is listed first. Comparing
+        that one label to the active band rejected genuine, verified findings
+        from the band the operator had actually chosen. So the test is
+        "is this frequency one of that band's channels".
         """
+        pool = result.occupied
         if band is None:
-            return result.best()
-        for cand in result.decodable:
-            if cand.band == band.key:
-                return cand
+            best = result.best()
+            return best
+        # Prefer something that is not only occupied but decodable, within the
+        # scoped band. A sweep result has no decodable members, which is fine --
+        # it falls through to the occupied pool rather than finding nothing.
+        for want_decodable in (True, False):
+            for cand in pool:
+                if want_decodable and not cand.decodable:
+                    continue
+                if bands.band_contains(cand.frequency_hz, band):
+                    return cand
         return None

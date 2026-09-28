@@ -17,6 +17,12 @@ name: checks
 #     check_worker   the streaming decode sustains a real frame rate
 #     diag_edges     sync detection genuinely locks onto SYNC pulses
 #     bench_coarse   the coarse gate's false-positive rate
+#     check_review_fixes
+#                   the 14 findings from the b63cec6 review, and the signed-IQ
+#                   and real-capture decode fixes that followed them. Runs with
+#                   no radio: its "real capture" case reads a committed excerpt
+#                   of a real HackRF recording, so a decoder regression that only
+#                   shows up on real samples still fails the build.
 #
 #   Smoke only (a crash fails the build; a judgement call does not):
 #     check_sources          sim/noise/real-capture end to end
@@ -115,7 +121,7 @@ jobs:
           status=0
           for check in \
             check_scan check_alerts check_ui check_layout check_worker \
-            diag_edges bench_coarse
+            diag_edges bench_coarse check_review_fixes
           do
             echo ""
             echo "::group::$check"

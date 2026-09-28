@@ -33,6 +33,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
@@ -328,8 +329,46 @@ class SourceStats:
         }
 
 
-def _u8_to_iq(raw: bytes | bytearray | memoryview) -> np.ndarray:
-    """Interleaved uint8 IQ (as hackrf writes it) to normalised complex64.
+class IQEncoding(Enum):
+    """How the raw interleaved I/Q bytes are scaled into the +/-1 complex domain.
+
+    This has to be explicit. The two encodings fold a zero-mean signal into
+    different parts of the same byte axis, so reading one as the other is not a
+    small error that a threshold can absorb -- it is a non-linear distortion of
+    every sample, plus a sign inversion. A decoder handed that produces noise,
+    while a signal-strength meter still reports a plausible number, because the
+    corruption is symmetric and its power is preserved. That is why this went
+    unnoticed.
+
+    ``SIGNED_INT8`` is what ``hackrf_transfer`` emits, both to stdout and to the
+    ``-r`` file. Confirmed against real 5802 MHz captures from the Mayhem
+    toolchain this project drives: 100% of bytes fall outside [64,192) and none
+    inside [108,147), which is the signature of two's-complement samples and the
+    exact opposite of offset-binary data. See ``tools/probe_iq_format.py``.
+
+    ``UNSIGNED_OFFSET`` is ``round(s * 127.5) + 128``, written by
+    :class:`SimSource` and by some third-party recorders. Kept because existing
+    unsigned recordings must keep working, and because the simulator is
+    validated against it.
+    """
+
+    SIGNED_INT8 = "signed-int8"
+    UNSIGNED_OFFSET = "unsigned-offset"
+
+
+#: Both encodings are scaled by 127.5 so that a sample decoded from a file and
+#: the same sample from the radio land on identical amplitudes. 127.5 is half the
+#: span of the 0..255 byte range, which is what the unsigned mapping was built
+#: around; reusing it keeps the two paths amplitude-comparable instead of
+#: introducing a 0.4% discrepancy between hardware and simulator.
+_IQ_SCALE = np.float32(1.0 / 127.5)
+
+
+def _u8_to_iq(
+    raw: bytes | bytearray | memoryview,
+    encoding: "IQEncoding" = IQEncoding.SIGNED_INT8,
+) -> np.ndarray:
+    """Interleaved raw I/Q bytes to normalised complex64.
 
     This sits directly in the streaming path -- it runs on every field, so its
     cost is a fixed slice of the 16.7 ms budget. The obvious spelling allocates
@@ -342,19 +381,115 @@ def _u8_to_iq(raw: bytes | bytearray | memoryview) -> np.ndarray:
     conversions into the real and imaginary views and nothing else, so there is
     no complex128 intermediate and no separate scale pass; the de-interleave is
     the single strided copy.
+
+    ``SIGNED_INT8`` needs no bias pass at all: the samples are already centred on
+    zero, so one multiply per component is the whole conversion. Offset-binary
+    data needs its 128 removed first; see the note on the two-pass form below for
+    why that ordering is not optional.
+
+    Both branches are exact, so the same sample written either way decodes to the
+    same complex value bit for bit. That is what lets a recording and a live
+    capture of one signal be compared directly.
     """
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    n = arr.size // 2
+    n = len(raw) // 2
     if n == 0:
         return np.zeros(0, dtype=np.complex64)
     iq = np.empty(n, dtype=np.complex64)
     re, im = iq.real, iq.imag
-    k = np.float32(1.0 / 127.5)
-    np.multiply(arr[0 : 2 * n : 2], k, out=re)
-    np.multiply(arr[1 : 2 * n : 2], k, out=im)
-    re -= np.float32(1.0)
-    im -= np.float32(1.0)
+
+    if encoding is IQEncoding.SIGNED_INT8:
+        arr = np.frombuffer(raw, dtype=np.int8, count=2 * n)
+        np.multiply(arr[0 : 2 * n : 2], _IQ_SCALE, out=re, casting="unsafe")
+        np.multiply(arr[1 : 2 * n : 2], _IQ_SCALE, out=im, casting="unsafe")
+        return iq
+
+    arr = np.frombuffer(raw, dtype=np.uint8, count=2 * n)
+    # The bias is removed *before* scaling, not after, which is the whole point of
+    # the two-pass form. The previous version scaled by 1/127.5 and then
+    # subtracted 1.0, on the assumption that 128/127.5 is 1. It is not: it is
+    # 1.0039. So byte 128 -- a zero sample, the exact centre of the encoding --
+    # decoded to +0.0039, and every sample carried a 0.4%-of-full-scale DC
+    # offset. Small enough to look like nothing and large enough to be wrong: it
+    # meant the same signal recorded two ways did not decode to the same thing.
+    # Subtracting in the float domain and then scaling once makes this path
+    # bit-identical to the signed path for the same underlying sample.
+    #
+    # The extra pass costs nothing that matters. The live radio path is signed
+    # and takes the single-multiply branch above; this one is only reached by the
+    # simulator and by offset-binary recordings.
+    np.subtract(arr[0 : 2 * n : 2], 128.0, out=re, casting="unsafe")
+    np.multiply(re, _IQ_SCALE, out=re)
+    np.subtract(arr[1 : 2 * n : 2], 128.0, out=im, casting="unsafe")
+    np.multiply(im, _IQ_SCALE, out=im)
     return iq
+
+
+@dataclass(frozen=True)
+class EncodingVerdict:
+    """What the histogram could and could not establish about a recording.
+
+    ``encoding`` is ``None`` when the evidence is not decisive. That is a real
+    outcome, not a failure to be papered over, and it is the common case for any
+    loud signal -- see :func:`detect_iq_encoding` for why.
+    """
+
+    encoding: IQEncoding | None
+    #: Share of bytes falling outside [64,192). The single number the verdict is
+    #: based on, kept so the reason can be shown and the test can be re-tuned.
+    share: float
+    reason: str
+
+
+def detect_iq_encoding(raw: bytes | bytearray | memoryview) -> EncodingVerdict:
+    """Infer whether ``raw`` is signed int8 or unsigned-offset -- if it can be.
+
+    Only used for recordings, where the format is a property of the file rather
+    than a known property of the tool that produced it. Hardware has a known
+    format, so it is declared, never guessed: a detector that silently
+    mis-classifies live samples would be far worse than the bug it replaces.
+
+    **The histogram cannot always tell them apart, and this says so.** The two
+    encodings differ by a fold about 128, so what distinguishes them is where
+    the samples sit relative to the middle of the byte axis:
+
+    * a *quiet* signal in either encoding sits near the middle, but the two
+      middle regions are different bytes -- offset-binary puts it at 128, signed
+      wraps it to 0 and 255. Easy to separate.
+    * a *loud* signal reaches the ends of the axis in either encoding, and a
+      wrapped loud signal is just a loud signal again. Indistinguishable.
+
+    So this is decisive for quiet recordings and genuinely undecidable for loud
+    ones. Quantified on real 5802 MHz captures (mean |x| 0.22): 100.0% of bytes
+    fall outside [64,192) and 0.0% inside [108,147). A synthetic unit-magnitude
+    fixture, by contrast, lands at 33.5% and is correctly reported as ambiguous.
+
+    Returning ``None`` rather than guessing is the point. Guessing here would
+    reproduce the original defect on a different input: a wrong decode that
+    produces noise and plausible power readings, with nothing to indicate it.
+    Callers fall back to a declared default and say so.
+    """
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    if arr.size < 1024:
+        return EncodingVerdict(None, 0.0, "too few bytes to judge")
+    share = float(np.mean((arr < 64) | (arr >= 192)))
+    if share >= 0.90:
+        return EncodingVerdict(
+            IQEncoding.SIGNED_INT8, share,
+            "almost every byte is at one end of the axis, which only a "
+            "two's-complement wrap produces at this amplitude",
+        )
+    if share <= 0.10:
+        return EncodingVerdict(
+            IQEncoding.UNSIGNED_OFFSET, share,
+            "almost every byte is near the middle of the axis, which is "
+            "offset-binary",
+        )
+    return EncodingVerdict(
+        None, share,
+        f"{share*100:.0f}% of bytes are at the ends of the axis -- "
+        f"consistent with either encoding, so the format cannot be "
+        f"established from the data",
+    )
 
 
 class IQSource(ABC):
@@ -372,11 +507,20 @@ class IQSource(ABC):
     #: asking its transfer helper which flags it understands.
     amp_supported = True
 
+    #: Byte encoding of the IQ this source produces. Subclasses must set this,
+    #: because guessing is how the waveform got inverted in the first place.
+    encoding: IQEncoding = IQEncoding.SIGNED_INT8
+
     def __init__(self, sample_rate: int = DEFAULT_SAMPLE_RATE) -> None:
         self.sample_rate = int(sample_rate)
         self.ring = IQRing()
         self.stats = SourceStats()
         self.frequency_hz = 0
+        #: The frequency the hardware is known to be receiving. Tracked
+        #: separately from ``frequency_hz``, which is only a *request*, so that a
+        #: failed retune does not leave the source claiming a frequency it is not
+        #: on and a retry does not short-circuit on a change that never happened.
+        self._applied_hz = 0
         self.lna_gain_db = 0
         self.vga_gain_db = 0
         #: RF amplifier on/off. This is a real switch, not a proxy: the
@@ -442,38 +586,83 @@ class IQSource(ABC):
 
     # -- control -----------------------------------------------------------
 
-    def tune(self, frequency_hz: int) -> bool:
-        """Retune. Returns True if the change took effect.
+    def tune(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
+        """Retune. Returns True if the change is in effect on the hardware.
 
         This is the *only* entry point, and it owns ``_tune_lock`` for the whole
         operation. Subclasses implement ``_apply_tune`` and must not take the
         lock again: it is a plain ``Lock``, so re-acquiring it on the same
-        thread blocks forever. That mistake is invisible until the first retune
-        to a genuinely different frequency, because a retune to the frequency
-        already tuned returns early and never reaches the second acquisition.
+        thread blocks forever.
+
+        Two things this gets right that a naive version does not.
+
+        *Requested* state is committed only after the hardware agrees. The
+        frequency is remembered separately in ``_applied_hz``, and a failed
+        apply leaves the requested value in place so a retry can actually
+        retry. The previous version wrote ``frequency_hz`` first and returned
+        the apply result, which meant a failure corrupted the reported state and
+        the next identical request took the early return and reported success
+        without touching the radio at all.
+
+        ``reconfigure=True`` forces a re-apply even at an unchanged frequency.
+        Gains and the amplifier switch are command-line arguments to the transfer
+        helper, so they only reach the hardware when the process is replaced.
+        Without this, moving a gain slider at the frequency already tuned changed
+        a Python attribute and nothing else, and the control silently did nothing
+        until some unrelated later action happened to restart reception.
         """
         with self._tune_lock:
-            if int(frequency_hz) == self.frequency_hz:
+            want = int(frequency_hz)
+            if (want == self.frequency_hz and not reconfigure
+                    and self._applied_hz == want):
                 return True
-            self.frequency_hz = int(frequency_hz)
-            return self._apply_tune()
+            self.frequency_hz = want
+            if not self._apply_tune():
+                return False
+            # Recorded here rather than in each subclass, because several of them
+            # legitimately short-circuit -- before the reader thread exists, or
+            # while the device is lent to the sweep tool -- and a subclass that
+            # forgets to set this would make tune() report a failure that never
+            # happened. While released this is a promise about the pending
+            # configuration, not about the air: reclaim_device() opens at
+            # frequency_hz, which is what this records.
+            self._applied_hz = want
+            return True
 
     def _apply_tune(self) -> bool:
         return True
 
-    def set_gains(self, lna_db: int, vga_db: int) -> None:
+    def set_gains(self, lna_db: int, vga_db: int) -> bool:
+        """Change gain and push it to the hardware. Returns True if applied.
+
+        Returns a bool because the caller has to be able to tell the operator
+        the truth: these are command-line flags on a child process, and a value
+        that never reached that process is not a gain setting.
+        """
         self.lna_gain_db = int(lna_db)
         self.vga_gain_db = int(vga_db)
+        return self.tune(self.frequency_hz, reconfigure=True)
+
+    @property
+    def applied_frequency_hz(self) -> int:
+        """The frequency the hardware is actually receiving, not merely asked for."""
+        return self._applied_hz
 
     def describe(self) -> str:
         return f"{self.kind} @ {self.frequency_hz/1e6:.1f} MHz, {self.sample_rate/1e6:g} MS/s"
 
     def take_iq(self, n_samples: int) -> np.ndarray:
-        """Newest ``n_samples`` complex samples as complex64."""
+        """Newest ``n_samples`` complex samples as complex64.
+
+        A snapshot read, not a consumption: it deliberately ignores the drain
+        cursor, because callers that want "whatever is in the ring right now"
+        (the settled-capture path, tests) need that and must not be surprised by
+        a cursor they did not move. Streaming consumers use :meth:`drain_iq`.
+        """
         raw = self.ring.read_newest(int(n_samples) * 2)
         if len(raw) < 16:
             return np.zeros(0, dtype=np.complex64)
-        return _u8_to_iq(raw)
+        return _u8_to_iq(raw, self.encoding)
 
     def drain_iq(self, max_samples: int = 300_000) -> np.ndarray:
         """Return the newest unconsumed samples, each handed over exactly once.
@@ -484,23 +673,53 @@ class IQSource(ABC):
         applied to a discontinuity. This hands over only the new tail, so no
         work is repeated and no seam appears.
 
-        ``max_samples`` also decides what happens to a backlog. Everything older
-        than the newest ``max_samples`` is *consumed and discarded*, because the
+        The previous version set the cursor and then read the newest
+        ``min(available, want)`` bytes regardless of where the cursor had been.
+        The cursor was therefore write-only, and the method's own docstring was
+        false: with a stalled, looping or disconnected source, every call
+        returned the same samples again. That fed one capture into the decoder
+        over and over, producing frames stamped with fresh times, so the frame
+        rate and the freshness indicator both read as healthy while nothing new
+        had arrived. Tracking the cursor properly is what makes those indicators
+        mean anything.
+
+        ``max_samples`` decides what happens to a backlog. Everything older than
+        the newest ``max_samples`` is *consumed and discarded*, because the
         alternative compounds: a decoder that falls behind asks for a bigger
         chunk next time, takes longer to process it, and falls further behind.
         Measured, that turned a 23 ms/field decoder into a 3-second lag while the
         live view showed older and older video. A live viewer should show the
         newest picture it can decode and drop what it cannot keep up with, so the
         default is a little over one field's worth.
+
+        The cursor tracks the ring's absolute write counter, which is monotonic
+        and never wraps, so there is no wraparound case to reason about. A
+        backlog larger than the ring is already gone: ``read_newest`` cannot
+        reach it, and the cursor is advanced to the present so the lost span is
+        not re-requested forever.
         """
         want = int(max_samples) * 2
-        self._consumed = self.ring.total_written
-        raw = self.ring.read_newest(min(self.ring.available(), want))
+        # Read the counter once. Checking it again after the read would let a
+        # sample written in between be counted as consumed without ever being
+        # handed over, which is the one failure mode a cursor must not have.
+        written = self.ring.total_written
+        pending = written - self._consumed
+        self._consumed = written
+        if pending <= 0:
+            return np.zeros(0, dtype=np.complex64)
+        raw = self.ring.read_newest(min(pending, want))
         if len(raw) < 16:
             return np.zeros(0, dtype=np.complex64)
-        return _u8_to_iq(raw)
+        return _u8_to_iq(raw, self.encoding)
 
     def reset_drain(self) -> None:
+        """Discard everything buffered so far without handing it to a decoder.
+
+        This is a real read boundary now, not a counter nobody reads: the next
+        :meth:`drain_iq` returns nothing until genuinely new samples arrive.
+        Used on retune, so a decoder cannot splice the tail of one frequency
+        onto the head of the next.
+        """
         self._consumed = self.ring.total_written
 
     def wait_for_bytes(self, n_bytes: int, timeout: float = 2.0) -> bool:
@@ -525,10 +744,28 @@ class IQSource(ABC):
         for the byte counter to advance by the amount wanted is what makes the
         returned block provably post-change, since bytes are appended in order
         and the newest ``n`` are the last ``n`` written.
+
+        Returns an empty array when the wait times out, and that is not a
+        subtlety. The previous version discarded ``wait_for_bytes``'s result and
+        returned the newest samples either way, so a receiver that had stalled
+        or gone away handed back the previous frequency's capture and the caller
+        scored it as a fresh measurement at the new one. With a radio lent to
+        another process this was not an edge case: the hop-walk fallback ran
+        entirely in that state and reported a full set of hop results built from
+        one pre-scan capture. An empty result and a genuinely quiet channel are
+        different answers, and the scanner must be able to tell them apart --
+        ``assess_frequency`` already returns None below 4096 samples, so an empty
+        capture becomes "could not measure" rather than "nothing there".
         """
         if not self.tune(int(frequency_hz)):
             return np.zeros(0, dtype=np.complex64)
-        self.wait_for_bytes(n_samples * 2, timeout=timeout)
+        if not self.wait_for_bytes(n_samples * 2, timeout=timeout):
+            self.stats.read_errors += 1
+            self.stats.last_error = (
+                f"no fresh samples at {int(frequency_hz)/1e6:.1f} MHz "
+                f"within {timeout:.1f}s -- measurement discarded, not reported"
+            )
+            return np.zeros(0, dtype=np.complex64)
         return self.take_iq(n_samples)
 
 
@@ -536,6 +773,12 @@ class HackrfSource(IQSource):
     """Live IQ from a HackRF via the ``hackrf_transfer`` receive-to-stdout path."""
 
     kind = "hackrf"
+
+    #: hackrf_transfer writes two's-complement 8-bit I/Q, both to stdout and to
+    #: its ``-r`` file. Declared rather than inferred: the format is a property
+    #: of the tool, so there is nothing to detect, and a wrong answer here
+    #: inverts the waveform while leaving power measurements plausible.
+    encoding = IQEncoding.SIGNED_INT8
 
     def __init__(
         self,
@@ -547,6 +790,13 @@ class HackrfSource(IQSource):
     ) -> None:
         super().__init__(sample_rate)
         self.frequency_hz = int(frequency_hz)
+        # The constructor's frequency is the one this source will be started at,
+        # so it counts as the applied one. Without this, the first
+        # tune(frequency_hz) would look like a change to be made and reconfigure
+        # the receiver, which is wrong: there is nothing to change, and the
+        # early return is exactly the behaviour that makes a repeated request
+        # cheap.
+        self._applied_hz = int(frequency_hz)
         self.lna_gain_db = int(lna_db)
         self.vga_gain_db = int(vga_db)
         self.executable = executable or find_hackrf_transfer()
@@ -969,6 +1219,7 @@ class FileSource(IQSource):
         loop: bool = True,
         realtime: bool = True,
         frequency_hz: int = 0,
+        encoding: IQEncoding | None = None,
     ) -> None:
         super().__init__(sample_rate)
         # A recording has no amplifier to switch, so the control would be a lie.
@@ -979,10 +1230,73 @@ class FileSource(IQSource):
         #: The frequency this recording was made at, if known. A file cannot be
         #: retuned, so this is metadata, and the only honest thing to report.
         self.frequency_hz = int(frequency_hz)
+        self._applied_hz = int(frequency_hz)
+        #: ``None`` means "judge it from the file, and say so". Recordings exist
+        #: in both encodings -- hackrf_transfer writes signed and :class:`SimSource`
+        #: writes offset-binary -- so unlike hardware there is genuinely nothing to
+        #: declare. But the data does not always settle it either (a loud recording
+        #: looks the same either way), so the verdict is kept and reported rather
+        #: than applied silently.
+        self._encoding_choice = encoding
+        self.encoding = encoding or IQEncoding.SIGNED_INT8
+        self._encoding_reason = "declared" if encoding else "not yet examined"
+
+    def tune(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
+        """Refuse. A recording is one frequency and cannot become another.
+
+        The base class happily stored the new value, which meant a replayed
+        capture could be assessed, charted and alerted as a channel it was never
+        recorded on -- the same samples reported under a different identity, and
+        band and channel names attached to a frequency that had nothing to do
+        with them. Declaring ``retunable = False`` was not enough on its own,
+        because nothing enforced it: the scan button checked the flag and the
+        manual frequency and channel controls did not.
+
+        So this returns False and changes nothing. Correcting the *metadata* of
+        a capture whose recorded frequency was mis-entered is a real need, but it
+        is a different operation from tuning, and it is the constructor's
+        ``frequency_hz`` argument. Conflating them is what made the same file
+        describe itself as two different channels.
+        """
+        if int(frequency_hz) != self.frequency_hz:
+            return False
+        return True
+
+    def set_gains(self, lna_db: int, vga_db: int) -> bool:
+        # Recorded IQ is fixed. Storing the numbers would make the UI show a
+        # gain the samples were never captured with.
+        return True
 
     def describe(self) -> str:
         where = f" @ {self.frequency_hz/1e6:.4f} MHz" if self.frequency_hz else ""
-        return f"file {self.path.name}{where}, {self.sample_rate/1e6:g} MS/s"
+        return (f"file {self.path.name}{where}, "
+                f"{self.sample_rate/1e6:g} MS/s, "
+                f"{self.encoding.value} ({self._encoding_reason})")
+
+    def _detect_encoding(self, raw: bytes) -> None:
+        """Settle the recording's byte format once, on the first real block.
+
+        Runs before any of the data reaches the ring, so the file is decoded one
+        way from its first sample rather than switching convention partway
+        through a replay. Detection is confined to files, where the format is
+        genuinely unknown; hardware declares its own.
+
+        When the data is undecidable -- a loud recording, where the two encodings
+        are not distinguishable -- it falls back to signed, the format the radio
+        produces and the only one this app's own recordings come from, and says
+        so in :meth:`describe`. A file that turns out to be offset-binary can be
+        loaded with an explicit ``encoding=``; what is not acceptable is
+        pretending the data settled it when it did not.
+        """
+        if self._encoding_choice is not None:
+            return
+        verdict = detect_iq_encoding(raw)
+        if verdict.encoding is None:
+            self.encoding = IQEncoding.SIGNED_INT8
+            self._encoding_reason = f"defaulted, {verdict.reason}"
+        else:
+            self.encoding = verdict.encoding
+            self._encoding_reason = "from the data"
 
     def _run(self) -> None:
         if not self.path.exists():
@@ -998,6 +1312,10 @@ class FileSource(IQSource):
                     data = fh.read(want)
                     if not data:
                         break
+                    # Decide the format before the first byte reaches the ring,
+                    # so the file is decoded consistently from end to end rather
+                    # than switching convention partway through a replay.
+                    self._detect_encoding(data)
                     self.ring.write(data)
                     self.stats.bytes_total += len(data)
                     if self.realtime:
@@ -1037,6 +1355,12 @@ class SimSource(IQSource):
 
     kind = "sim"
 
+    #: The simulator *writes* offset-binary bytes (see ``_run``), so it reads them
+    #: back the same way. Declared, because inheriting the hardware default here
+    #: would mean the simulator validated itself against the wrong convention --
+    #: which is exactly how the hardware bug stayed invisible for so long.
+    encoding = IQEncoding.UNSIGNED_OFFSET
+
     def __init__(
         self,
         frequency_hz: int = 5_802_000_000,
@@ -1051,6 +1375,9 @@ class SimSource(IQSource):
     ) -> None:
         super().__init__(sample_rate)
         self.frequency_hz = int(frequency_hz)
+        # As for HackrfSource: the constructor frequency is the one the source
+        # starts at, so it is the applied one and a repeated tune is free.
+        self._applied_hz = int(frequency_hz)
         self.video = video
         self.ntsc = ntsc
         self.amplitude = amplitude
@@ -1158,10 +1485,6 @@ class SimSource(IQSource):
         self._scratch_iq = np.empty((self._block_n, 2), dtype=np.float32)
         self._phase_buf = np.empty(self._block_n, dtype=np.float32)
         self._dev_buf = np.empty(self._block_n, dtype=np.float32)
-
-    def describe(self) -> str:
-        mode = "synthetic video" if self.video else "synthetic noise"
-        return f"sim {mode} @ {self.frequency_hz/1e6:.4f} MHz"
 
     def _deviation(self, nlines: int) -> np.ndarray:
         """Per-sample FM deviation (radians) for ``nlines`` whole video lines.

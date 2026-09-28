@@ -165,7 +165,16 @@ EXACT_TOL_HZ = 250_000
 
 
 def match_frequency(freq_hz: float, bands: tuple[Band, ...] = BANDS_58) -> Match | None:
-    """Snap ``freq_hz`` to the nearest channel across all ``bands``."""
+    """Snap ``freq_hz`` to the nearest channel across all ``bands``.
+
+    Returns the single closest match, and "single" is the whole problem: band
+    plans share frequencies, so a carrier on 5880 MHz is both Raceband R7 and
+    F8, and this hands back whichever happens to come first in the list. Any
+    caller that then asks "is this finding in Raceband?" by comparing that one
+    label gets the wrong answer for a real, common channel. Use
+    :func:`match_all_frequencies` where the question is about membership rather
+    than about naming.
+    """
     best: Match | None = None
     for band in bands:
         for i, f in enumerate(band.channels, start=1):
@@ -173,6 +182,36 @@ def match_frequency(freq_hz: float, bands: tuple[Band, ...] = BANDS_58) -> Match
             if best is None or abs(off) < abs(best.offset_hz):
                 best = Match(band, i, f, off, abs(off) <= EXACT_TOL_HZ)
     return best
+
+
+def match_all_frequencies(
+    freq_hz: float, band: Band, tol_hz: float = EXACT_TOL_HZ
+) -> list[tuple[int, int]]:
+    """Every channel of ``band`` that ``freq_hz`` could be, as (channel, offset).
+
+    The membership question, as opposed to the naming question. "Does this
+    finding belong to Raceband?" is answered by looking at Raceband's own
+    channels, not by asking which band globally claims the frequency first --
+    the two disagree whenever two plans share a channel, which for the 5.8 GHz
+    plans is most of the interesting part of the band.
+    """
+    out: list[tuple[int, int]] = []
+    for i, f in enumerate(band.channels, start=1):
+        off = int(round(freq_hz - f))
+        if abs(off) <= tol_hz:
+            out.append((i, off))
+    return out
+
+
+def band_contains(freq_hz: float, band: Band, tol_hz: float = EXACT_TOL_HZ) -> bool:
+    """Whether ``freq_hz`` sits on one of ``band``'s channels.
+
+    This is the test that selection should use. Comparing against a single
+    globally-chosen label is equivalent to asking whether that particular band
+    happened to be listed first, which is a property of the chart's ordering and
+    not of the signal.
+    """
+    return bool(match_all_frequencies(freq_hz, band, tol_hz))
 
 
 def is_legal(freq_hz: float, region: Region = Region.US) -> bool:

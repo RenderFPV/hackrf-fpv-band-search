@@ -685,6 +685,11 @@ class MainWindow(QMainWindow):
         #: a way to lose your gain setup.
         self._lna_saved_db = int(source.lna_gain_db)
 
+        #: The channel the operator was on when the last search started, so it
+        #: can be restored if the search does not end up moving the receiver
+        #: somewhere new. Zero means "nothing to restore".
+        self._pre_scan_hz = int(source.frequency_hz)
+
         self.setWindowTitle("FPV band search and alert")
         self._build()
 
@@ -759,6 +764,18 @@ class MainWindow(QMainWindow):
         self.freq.setSingleStep(1)
         self.freq.setValue(int(round(self.source.frequency_hz / 1e6)))
         self.freq.valueChanged.connect(self._on_freq_spin)
+        if not self.source.retunable:
+            # A recording is one frequency. Offering a tuner that cannot tune is
+            # worse than offering none: dragging it used to relabel the capture
+            # with a channel it was never recorded on, and the source now refuses
+            # that, so the control would do nothing but raise an error. Disabled,
+            # with the reason on the tooltip.
+            self.freq.setEnabled(False)
+            self.freq.setToolTip(
+                f"This source is a recorded capture, fixed at "
+                f"{bands.format_mhz(self.source.frequency_hz)}. "
+                f"Its samples cannot be retuned."
+            )
         gv.addWidget(QLabel("tune"), 1, 0)
         gv.addWidget(self.freq, 1, 1)
 
@@ -932,7 +949,15 @@ class MainWindow(QMainWindow):
         gv.addWidget(QLabel("contrast"), 1, 0)
         gv.addWidget(self.contrast, 1, 1)
         self.invert = QCheckBox("invert")
-        self.invert.toggled.connect(self.panel.set_controls)
+        # Connected through an explicit keyword, not straight to set_controls.
+        # ``toggled`` emits a bool, and set_controls' first positional parameter
+        # is *brightness*, so connecting it directly made ticking this box set
+        # brightness to 1 and leave invert False. The two sliders above are
+        # already written the safe way; this one was not, and it is invisible
+        # unless you actually click the checkbox rather than call the setter.
+        self.invert.toggled.connect(
+            lambda v_: self.panel.set_controls(invert=bool(v_))
+        )
         self.smooth = QCheckBox("smooth scaling")
         self.smooth.setChecked(True)
         self.smooth.toggled.connect(self._on_smooth)
@@ -1074,26 +1099,51 @@ class MainWindow(QMainWindow):
         Costs a retune, like any LNA or gain change: the flags are command-line
         arguments, so they can only change when the process is replaced. Not a
         control to flick mid-sweep.
+
+        ``reconfigure=True`` is what makes that cost actually happen. Toggling
+        the switch while already tuned to this frequency used to call
+        ``_tune(frequency_hz)``, which short-circuits on an unchanged frequency
+        and never restarts the process -- so the checkbox moved and the
+        amplifier carried on amplifying, with no indication that anything had
+        failed to happen.
         """
         if not on:
             self._lna_saved_db = self.lna.value()
         self.source.amp_enabled = bool(on)
-        self._tune(self.source.frequency_hz, ask_alert=False)
+        if not self._reconfigure():
+            self.amp.blockSignals(True)
+            self.amp.setChecked(self.source.amp_enabled)
+            self.amp.blockSignals(False)
+            self._status.showMessage("the amplifier switch did not reach the radio")
 
     def _on_gain(self, _v: int) -> None:
-        self.source.lna_gain_db = self.lna.value()
-        self.source.vga_gain_db = self.vga.value()
-        self._tune(self.source.frequency_hz, ask_alert=False)
+        if not self.source.set_gains(self.lna.value(), self.vga.value()):
+            self._status.showMessage("the gain change did not reach the radio")
+
+    def _reconfigure(self) -> bool:
+        """Push the current settings to the hardware without moving frequency.
+
+        The single place that answers "how do changed settings reach the radio",
+        so the gain sliders and the amplifier switch cannot drift apart again.
+        """
+        return self.source.tune(self.source.frequency_hz, reconfigure=True)
 
     def _tune(self, freq_hz: int, ask_alert: bool = False,
-              clear_alerts: bool = True) -> None:
+              clear_alerts: bool = True) -> bool:
+        """Move the receiver. Returns True only if the hardware actually moved.
+
+        The return value is load-bearing. Callers used to ignore it, so
+        auto-select could report "watching F4 @ 5800 MHz" after a tune that had
+        failed and left the radio exactly where it was -- a success message
+        about a channel the app was not listening to.
+        """
         if not self.source.tune(freq_hz):
             QMessageBox.warning(
                 self, "Tune failed",
                 f"Could not tune to {bands.format_mhz(freq_hz)}.\n"
                 f"{self.source.stats.last_error or 'the source reported no reason.'}",
             )
-            return
+            return False
         # The ring still holds the previous frequency. Dropping it means the
         # decoder does not spend a field trying to lock a sync train in samples
         # from a different channel.
@@ -1110,6 +1160,7 @@ class MainWindow(QMainWindow):
         self.chart.set_tune(self.source.frequency_hz)
         if ask_alert:
             self._check_current()
+        return True
 
     def _search_span(self) -> tuple[int, int]:
         """What 'Scan band' sweeps: the active band plan if one is chosen.
@@ -1163,7 +1214,13 @@ class MainWindow(QMainWindow):
         self.freq.blockSignals(True)
         self.freq.setValue(int(round(best.frequency_hz / 1e6)))
         self.freq.blockSignals(False)
-        self._tune(best.frequency_hz, ask_alert=False, clear_alerts=False)
+        if not self._tune(best.frequency_hz, ask_alert=False, clear_alerts=False):
+            # _tune has already told the operator why. Returning True here would
+            # overwrite that with a confident "watching <channel>" for a channel
+            # the receiver never moved to, and the caller would carry on as
+            # though it had.
+            self._status.showMessage("auto-select failed: the radio did not move")
+            return False
         self._status.showMessage(f"watching {best.label()}")
         return True
 
@@ -1185,6 +1242,10 @@ class MainWindow(QMainWindow):
                 "signal at every hop. It is assessed in place instead.",
             )
             return
+        # Remember where the operator was, so a search that does not move the
+        # receiver anywhere can put it back. The hop walk drives the shared
+        # source and leaves it on the last hop it visited.
+        self._pre_scan_hz = self.source.frequency_hz
         self.progress.setValue(0)
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -1229,11 +1290,26 @@ class MainWindow(QMainWindow):
                 if self.alerts.active
                 else "idle"
             )
+        # Put the receiver back where the operator left it unless the search
+        # moved it to something new.
+        #
+        # A hop walk retunes the shared source for every hop, so when the search
+        # finishes the radio is sitting on whichever hop came last -- typically the
+        # top of the band. Previously the only thing that could move it was
+        # auto-select, and only when it succeeded. So the two obvious cases both
+        # left the receiver somewhere the operator did not choose: auto-select
+        # unticked, or a search that found nothing. The frequency box still read
+        # the original channel, so the app claimed to be watching a channel it was
+        # not receiving, and said "nothing above the noise floor" while frozen on
+        # an arbitrary frequency.
         if self.autotune.isChecked():
             # After the alert bookkeeping, not before: _tune() clears the
             # alert engine, and doing that first would make a brand new finding
             # look like it had never been raised.
-            self._select_best(announce=False)
+            if self._select_best(announce=False):
+                self._pre_scan_hz = self.source.frequency_hz
+                return
+        self._restore_pre_scan_tuning(res)
 
     def _on_scan_failed(self, message: str) -> None:
         self.scan_btn.setEnabled(True)
@@ -1270,19 +1346,65 @@ class MainWindow(QMainWindow):
                 return self.alerts.repeat_count(c)
         return 1
 
+    def _restore_pre_scan_tuning(self, res: scan.ScanResult) -> None:
+        """Return the receiver to the channel the operator was on.
+
+        Covers every path where a search finished without choosing a channel:
+        auto-select unticked, nothing found, a cancelled search, and a search
+        that could not run at all. All four used to leave the radio on the last
+        hop, and only the first two were even reachable before.
+
+        Cancellation and failure go through here too, deliberately. They leave
+        the radio mid-band just as a completed empty scan does, so treating them
+        differently would mean the one case where the operator most wants their
+        channel back is the one that loses it.
+        """
+        want = self._pre_scan_hz
+        if not want or want == self.source.frequency_hz:
+            return
+        if not self.source.retunable:
+            # A file or simulator cannot move, and pretending otherwise would
+            # fail. Nothing to restore: it never left.
+            return
+        if self._tune(want, ask_alert=False, clear_alerts=True):
+            why = ("search cancelled" if res.stopped_early else
+                   "search could not run" if res.error else "nothing found")
+            self._status.showMessage(
+                f"{why} -- back on {bands.format_mhz(want)}"
+            )
+
     def _check_current(self) -> None:
-        """Assess the channel the operator just chose and alert if it is live."""
+        """Assess the channel the operator just chose and alert if it is live.
+
+        A quiet channel gets a report, not an alert. This used to hand every
+        assessment to the alert engine, and since an assessment always yields a
+        candidate -- including one classified NOISE -- asking about an empty
+        channel produced a FOUND event, a banner and an audible beep for a
+        channel with nothing on it. An alert that fires on silence trains the
+        operator to ignore it, which costs the one property an alert exists to
+        have.
+        """
         cand = self.scanner.assess_frequency(self.source.frequency_hz)
         if cand is None:
             return
         res = scan.ScanResult(
             lo_hz=self.source.frequency_hz, hi_hz=self.source.frequency_hz
         )
-        res.candidates = [cand]
-        events = self.alerts.update(res)
+        if cand.reading.occupied:
+            res.candidates = [cand]
+            events = self.alerts.update(res)
+        else:
+            # Nothing there. Record the result so the chart and the band display
+            # stay consistent with what was just measured, but keep it out of the
+            # alert engine entirely.
+            events = []
+            self._status.showMessage(
+                f"{bands.format_mhz(cand.frequency_hz)}: nothing above the "
+                f"noise floor ({cand.reading.peak_to_median_db:+.1f} dB)"
+            )
         self._last_result = res
         self._refresh_marks()
-        if not events:
+        if not events and cand.reading.occupied:
             self._apply_alert_silent(cand)
 
     def _apply_alert_silent(self, cand: scan.Candidate) -> None:
@@ -1326,11 +1448,30 @@ class MainWindow(QMainWindow):
         dropped = self.source.ring.dropped_bytes // 2
         elapsed = max(1e-6, time.monotonic() - st.started_at)
         rate = src.bytes_total / 2 / elapsed / 1e6
-        lock = "locked" if st.locked_frames else "no lock"
+        # Judged on how recently a frame was published, not on whether one has
+        # ever been published. ``locked_frames`` is cumulative, so it could only
+        # ever say "locked" afterwards: stop the receiver, lose the transmitter,
+        # and the status line kept claiming a lock it no longer had.
+        lock = "locked" if self.worker.locked else "no lock"
+        if self.worker.stats.decode_errors:
+            lock = f"decode errors x{self.worker.stats.decode_errors}"
+        # The sync figure is only meaningful while locked, and printing it
+        # unconditionally is what concealed a real decoder fault. On a genuine
+        # 5802 MHz capture the sync detector reported 90% for as long as it was
+        # fed noise or a signal whose lines it could not assemble, while not one
+        # frame was ever produced -- so the status line read "no lock  sync 90%"
+        # and a user had no way to tell that from a healthy-but-noisy lock. The
+        # number now appears only when there is a lock to justify it.
+        sync = f"  sync {st.sync_quality*100:3.0f}%" if self.worker.locked else ""
+        # Likewise, a field that needed most of its line positions reconstructed
+        # is a weaker result than a fully detected one, and the difference is
+        # visible rather than absorbed.
+        grid = (f"  {st.lines_from_grid}/240 lines from grid"
+                if st.lines_from_grid else "")
         self._status.showMessage(
             f"{st.frames} frames  {st.frame_rate():4.1f} fps  "
             f"decode {st.decode_ms:4.1f} ms  cycle {st.cycle_ms:4.1f} ms  "
-            f"{lock}  sync {st.sync_quality*100:3.0f}%  "
+            f"{lock}{sync}{grid}  "
             f"source {rate:4.2f} MS/s"
             + (f"  dropped {dropped/1e6:.1f} Ms" if dropped else "")
         )
@@ -1340,7 +1481,20 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.cancel()
-            self._scan_thread.wait(3000)
+            # Wait for the search to actually finish before tearing down the
+            # radio, and check that it did. The wait used to be 3 s with the
+            # result discarded, so a scan still running -- typically stuck
+            # reclaiming a device that is slow to reopen -- was simply abandoned,
+            # and its completion then ran against a window that was on its way
+            # out. That is the worst time to run code that touches widgets.
+            #
+            # 10 s, because reclaiming the radio after a sweep is a real USB
+            # reopen and the handover wedge can take a while. A scan that has
+            # not finished by then is not going to, and the window must still
+            # close: an app that cannot be closed is worse than a scan that was
+            # abandoned.
+            if not self._scan_thread.wait(10_000):
+                self._status.showMessage("closing: the search did not stop in time")
         self._paint.stop()
         self._stats.stop()
         self.worker.stop()

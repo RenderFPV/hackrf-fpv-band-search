@@ -585,6 +585,26 @@ class RasterFrame:
     line_samples: float
     locked: bool
     quality: float
+    #: How many of ``lines_used`` rows were placed on the fitted line grid rather
+    #: than at a detected sync pulse. The *samples* behind those rows are real
+    #: video -- it is the line's position that was reconstructed, not its
+    #: content -- but a frame that needed 40 of 240 positions reconstructed is a
+    #: different claim from one that needed none, and the count is carried so the
+    #: caller can say which one it is showing.
+    lines_from_grid: int = 0
+
+
+@dataclass
+class LineRun:
+    """A chosen window of ``want`` scanlines, in sample positions.
+
+    ``positions`` always has exactly ``want`` entries. ``from_grid`` is how many
+    of them were placed on the fitted grid rather than at a real detection.
+    """
+
+    positions: np.ndarray
+    detected: int
+    from_grid: int
 
 
 def line_grid(
@@ -685,25 +705,28 @@ def _resample_2d(block: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
 class Rasteriser:
     """Extracts one clean field from a chunk of demodulated composite video.
 
-    Strategy: render the most recent run of exactly ``visible_lines``
-    scanlines whose sync-to-sync spacing all match the measured line period.
+    Strategy: render the most recent run of exactly ``visible_lines`` scanlines,
+    sampled at their measured positions where the sync detector found them and on
+    a locally fitted grid where it did not.
 
-    Restricting a frame to a *contiguous* run is what makes the picture clean,
-    and it is the single biggest quality lever in this decoder:
+    Restricting a frame to a *contiguous* run of line numbers is what makes the
+    picture clean, and it is the single biggest quality lever in this decoder:
 
-    * Field blanking (an ~80-90 line gap every field) can never fall inside a
-      frame, so no row is interpolated across a discontinuity.
+    * Field blanking (22.5 lines in NTSC, 24.5 in PAL) can never fall inside a
+      frame, so no row is interpolated across a discontinuity. :attr:`max_fill`
+      is what keeps the two apart; see :meth:`select_run` for the measurement.
     * Across ~240 lines the per-line detection jitter does not accumulate into
-      visible shear, so lines can be sampled at their raw detected positions.
-      Measured on a known capture, doing this scored +0.80 adjacent-row
-      correlation; forcing a single global grid across the whole capture scored
-      +0.25, because any error in the fitted period compounds over 8000 lines.
+      visible shear, so detected lines are sampled at their raw positions rather
+      than on one global grid. Measured on a known capture, doing this scored
+      +0.80 adjacent-row correlation; forcing a single global grid across the
+      whole capture scored +0.25, because any error in the fitted period compounds
+      over 8000 lines.
     * "Most recent" means every emitted frame is the freshest thing in the
       buffer, which is what a live viewer wants.
 
-    The cost is that a field containing a dropped line is skipped rather than
-    patched. That is the right trade for viewing: the next field arrives in
-    17 ms.
+    The cost is that a field needing a *reconstructed* row position reports it
+    (:attr:`RasterFrame.lines_from_grid`) rather than passing it off as fully
+    detected, and a dropout larger than :attr:`max_fill` ends the run.
 
     On picture quality: adjacent-row correlation on the *raw* 483x240 active
     window measures about +0.09 for this decoder and about +0.09 for the
@@ -715,9 +738,17 @@ class Rasteriser:
     live display, but it should not be mistaken for a sharper decode.
     """
 
-    def __init__(self, width: int = 160, out_h: int | None = None) -> None:
+    def __init__(self, width: int = 160, out_h: int | None = None,
+                 max_fill: int = 20) -> None:
         self.width = int(width)
         self.out_h = int(out_h) if out_h else None
+        #: Largest signal dropout :meth:`select_run` bridges rather than treats as
+        #: the end of a field. 20 is measured, not chosen: the real 5802 MHz
+        #: capture's dropouts run 5-20 lines and field blanking is 22.5 (NTSC) /
+        #: 24.5 (PAL), so a separating integer sits between them. This bridges
+        #: every dropout observed and no blanking interval, which is what keeps
+        #: the no-interpolation-across-a-discontinuity property intact.
+        self.max_fill = int(max_fill)
         self._spec: VideoSpec | None = None
         self.frames_emitted = 0
         self.lines_skipped = 0
@@ -735,30 +766,117 @@ class Rasteriser:
 
     @staticmethod
     def select_run(
-        starts: np.ndarray, line_len: float, want: int, tol_frac: float = 0.15
-    ) -> np.ndarray | None:
-        """Freshest contiguous run of >= ``want`` evenly spaced lines.
+        starts: np.ndarray,
+        line_len: float,
+        want: int,
+        tol_frac: float = 0.15,
+        max_fill: int = 20,
+    ) -> LineRun | None:
+        """Freshest run of ``want`` lines, bridging the signal's dropouts.
 
-        Every maximal run of nominal spacing is found, and the one that ends
-        latest is used. Anchoring only on the newest detected line would reject
-        the whole buffer whenever a single line was dropped near the end; with
-        roughly one dropped line per hundred, that would starve the decoder
-        even though clean fields are available slightly earlier in the buffer.
+        **Requiring ``want`` consecutive *detected* lines made real signals
+        undecodable, and this was the reason.** Measured on a genuine 5802 MHz
+        HackRF capture of an analog FPV VTX, the sync detector fires on 82.7% of
+        lines -- but the missing 17.3% are not scattered. The gap histogram is
+        399 gaps of one line, 9 of two lines, and then 8 chunks of 5, 6, 6, 8, 8,
+        8, 17 and 20 lines. So the losses are signal dropouts, not jitter, and
+        because the largest runs of clean detections were 112 lines against the
+        240 a field needs, the decoder emitted no frame at all from a real VTX
+        while the sync detector simultaneously reported quality 0.90. It claimed
+        a lock it could not deliver; :meth:`push` now reconciles the two.
+
+        The rule is therefore: a gap of up to ``max_fill`` line periods is
+        *bridged* rather than ending the run, and larger gaps still end it. That
+        second half is what preserves the property this class was written for --
+        field blanking is never spanned. The two are told apart by size, which is
+        only safe because the numbers are integers and widely separated:
+
+        * NTSC blanking is 22.5 lines and PAL's is 24.5, so any gap rounds to 22
+          or more.
+        * The largest dropout in the real capture is 20 lines, which rounds to 20.
+
+        A default of 20 therefore bridges every dropout measured and no blanking
+        interval, with the separating integer in between. Verified by sweeping the
+        parameter over the real capture: at 8 the mean adjacent-row correlation is
+        +0.8954, at 12 +0.8984, at 20 +0.9020, and it stops improving past 20
+        (+0.9032 at 32) -- i.e. bridging blanking buys nothing measurable, so there
+        is no reason to do it. Against 2, which bridged nothing useful, no frame
+        was produced at all.
+
+        Note what "bridged" means: the missing rows are placed on the grid fitted
+        to the surrounding detections, and the *samples* at those positions are
+        real video. Only the lines' positions are reconstructed. Detected lines
+        still get their own measured positions, and the number of reconstructed
+        ones is reported on the frame rather than quietly absorbed.
         """
         n = int(starts.size)
-        if n < want or want < 2:
+        if n < 2 or want < 2 or line_len <= 0:
             return None
-        good = np.abs(np.diff(starts) - line_len) <= line_len * float(tol_frac)
-        # index i is a run start when the gap before it is not nominal
-        run_start = np.flatnonzero(~good) + 1
-        bounds = np.concatenate(([0], run_start, [n]))
-        best: np.ndarray | None = None
+
+        # Walk the detections, turning each gap into an integer number of lines.
+        # A gap of ~22 lines (field blanking) therefore advances the counter by
+        # 22, and the consecutive-run search below rejects it, while a gap of one
+        # or two lines stays consecutive and is fillable.
+        single = np.diff(starts)
+        single = single[single < 1.5 * float(line_len)]
+        period = float(np.median(single)) if single.size >= 3 else float(line_len)
+        if not np.isfinite(period) or period <= 0:
+            period = float(line_len)
+        steps = np.maximum(1, np.rint(np.diff(starts) / period).astype(np.int64))
+        line_no = np.concatenate(([0], np.cumsum(steps))).astype(np.int64)
+
+        # Runs of consecutive line numbers, allowing a bounded fill.
+        fillable = (steps - 1) <= int(max_fill)
+        breaks = np.flatnonzero(~fillable) + 1
+        bounds = np.concatenate(([0], breaks, [n]))
+
+        best: LineRun | None = None
+        best_end = -1
         for k in range(bounds.size - 1):
             lo, hi = int(bounds[k]), int(bounds[k + 1])
-            if hi - lo >= want:
-                best = starts[hi - want : hi]   # later runs overwrite earlier
-        return best
+            if hi - lo < 2:
+                continue
+            span = int(line_no[hi - 1] - line_no[lo]) + 1
+            if span < want:
+                continue
+            end = int(line_no[hi - 1])
+            if end <= best_end:
+                continue          # an older run cannot beat a fresher one
+            # Freshest window inside this run: the last `want` lines.
+            first = end - want + 1
+            sel = (line_no >= first) & (line_no <= end)
+            got = starts[sel]
+            if got.size == 0:
+                continue
+            sel_no = line_no[sel]
 
+            # Fit the grid to the *global* line numbering, not to a local one.
+            # line_grid() returns positions for detected lines only, which is
+            # useless here: with ~18% of lines missing it can never produce
+            # `want` positions, and the size guard below rejected every frame.
+            # What is needed is the grid for every integer line in the window,
+            # with the measured positions laid back on top where they exist.
+            _, _, per2 = line_grid(got, period, max_gap_lines=float(max_fill) + 2.0)
+            if not np.isfinite(per2) or per2 <= 0:
+                per2 = period
+            phase = float(np.median(got - per2 * sel_no.astype(np.float64)))
+            full = phase + per2 * np.arange(first, end + 1, dtype=np.float64)
+
+            # Every detected line keeps its own measured position; only the
+            # genuinely missing ones are invented. This is the accuracy the
+            # class was built around, and the count of what was invented is
+            # reported rather than hidden.
+            chosen = full.copy()
+            slot = sel_no - first
+            hit = (slot >= 0) & (slot < full.size)
+            chosen[slot[hit]] = got[hit]
+            detected = int(hit.sum())
+            from_grid = int(want - detected)
+            if chosen.size != want or detected == 0:
+                continue
+            best = LineRun(chosen, detected, from_grid)
+            best_end = end
+        return best
     # -- main entry point --------------------------------------------------
 
     def push(
@@ -777,8 +895,6 @@ class Rasteriser:
         self._spec = spec
         line = float(sync.line_samples)
         want = spec.visible_lines
-        if starts.size < want:
-            return None
 
         offset = line * spec.crop_start
         span = line * spec.crop_width
@@ -787,16 +903,24 @@ class Rasteriser:
         if limit <= 0:
             return None
         usable = starts[starts + offset + span <= limit]
-        if usable.size < want:
+
+        # The floor on detections is the pigeonhole bound, not a tolerance knob:
+        # :meth:`select_run` tolerates at most ``max_fill`` consecutive misses, so
+        # 240 rows cannot be filled from fewer than 80 detections. Requiring
+        # ``want`` detections instead -- which is what this used to do -- is what
+        # made real captures undecodable, and the check has no meaning now that a
+        # run may be partly reconstructed.
+        floor = max(8, want // (self.max_fill + 1))
+        if usable.size < floor:
             return None
 
-        run = self.select_run(usable, line, want)
+        run = self.select_run(usable, line, want, max_fill=self.max_fill)
         if run is None:
             self.lines_skipped += 1
             return None
 
         rows = self._render(
-            demod, run, line, offset, span, spec, brightness, contrast, invert
+            demod, run.positions, line, offset, span, spec, brightness, contrast, invert
         )
         if rows is None:
             return None
@@ -810,6 +934,7 @@ class Rasteriser:
             line_samples=line,
             locked=True,
             quality=sync.quality,
+            lines_from_grid=run.from_grid,
         )
 
     # -- rendering ---------------------------------------------------------

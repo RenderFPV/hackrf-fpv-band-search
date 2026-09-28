@@ -44,6 +44,17 @@ from .sdr import IQSource
 #: roughly a field and a half of slack.
 DEFAULT_WINDOW = 320_000
 
+#: How old a published frame may be before it stops counting as live video.
+#:
+#: NTSC analogue video is 59.94 fields per second, so a field is 16.7 ms and a
+#: whole frame is 33.3 ms. Half a second is therefore about fifteen frames of
+#: slack: long enough that an ordinary hiccup -- one lost field, a retune, the
+#: decoder taking a moment to re-lock -- does not flicker the panel or flap the
+#: status line, and short enough that a transmitter which has gone away, or a
+#: radio which has been unplugged, stops being described as locked well before
+#: anyone could mistake the frozen picture for a live one.
+STALE_FRAME_S = 0.5
+
 
 @dataclass
 class DecodeStats:
@@ -60,6 +71,17 @@ class DecodeStats:
     sync_quality: float = 0.0
     standard: str = ""
     chunk_samples: int = 0
+    #: Decode exceptions that were caught and survived. Non-zero means the
+    #: decoder itself is misbehaving, which is a different fault from "no video
+    #: is arriving" and was previously invisible.
+    decode_errors: int = 0
+    last_decode_error: str = ""
+    #: Scanlines of the most recent field that were placed on the fitted line grid
+    #: because no sync pulse was detected on them. The samples there are real
+    #: video; only the lines' positions were reconstructed. Reported because a
+    #: field that needed 40 of 240 positions reconstructed is a weaker claim than
+    #: one that needed none, and a viewer is entitled to know which they have.
+    lines_from_grid: int = 0
 
     def frame_rate(self) -> float:
         el = max(1e-6, time.monotonic() - self.started_at)
@@ -80,6 +102,7 @@ class VideoFrame:
     sync_quality: float
     standard: str
     locked: bool
+    lines_from_grid: int = 0
 
     @property
     def width(self) -> int:
@@ -153,6 +176,7 @@ class VideoDecoder:
             sync_quality=sync.quality,
             standard=fr.spec.name,
             locked=True,
+            lines_from_grid=fr.lines_from_grid,
         )
 
 
@@ -165,6 +189,11 @@ class DecodeWorker:
         self.stats = DecodeStats()
         self._lock = threading.Lock()
         self._frame: VideoFrame | None = None
+        self._published_at = 0.0
+        #: Serialises access to the decoder itself, which both the decode loop and
+        #: any reset from the GUI thread mutate. Separate from ``_lock``, which
+        #: only guards the published frame.
+        self._decoder_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_decode = 0.0
@@ -183,12 +212,49 @@ class DecodeWorker:
     # -- frame access (safe from any thread) --------------------------------
 
     def latest(self) -> VideoFrame | None:
+        """Newest frame, or None if it has gone stale.
+
+        Staleness is a decision made here rather than at paint time, so that
+        every consumer gets the same answer. The previous version returned the
+        last frame unconditionally, which meant a receiver that stopped or a
+        transmitter that vanished left the last picture on screen indefinitely
+        while the status line still said "locked" -- the two together read as a
+        live picture of a channel that was no longer there.
+
+        The frame itself is kept, so a brief drop-out (a retune, a field lost to
+        a scheduling hiccup) does not flash the panel black; what changes is that
+        the *lock* claim expires. The panel is told the age, so it can mark a
+        frozen image rather than silently presenting it as current.
+        """
         with self._lock:
-            return self._frame
+            frame = self._frame
+        if frame is None:
+            return None
+        if self.frame_age_s() > STALE_FRAME_S:
+            return None
+        return frame
+
+    def frame_age_s(self) -> float:
+        """Seconds since a frame was last published, or infinity if none ever was."""
+        with self._lock:
+            if self._frame is None:
+                return float("inf")
+            return max(0.0, time.monotonic() - self._published_at)
+
+    @property
+    def locked(self) -> bool:
+        """Whether video is *currently* locked, judged on recency.
+
+        Not "has ever locked". That was a cumulative counter, so the answer could
+        never go back to False: switch channels, unplug the radio, and the app
+        kept insisting it had a lock. Lock is a statement about the last fraction
+        of a second, and it has to be able to lapse.
+        """
+        return self.frame_age_s() <= STALE_FRAME_S
 
     def reset_stats(self) -> None:
         self.stats = DecodeStats()
-        self.decoder.reset()
+        self._reset_decoder()
 
     def reset(self) -> None:
         """Forget the current frequency's picture.
@@ -198,12 +264,25 @@ class DecodeWorker:
         two frequencies is published in the meantime -- a picture made of two
         different transmitters, which looks like a decoder fault rather than a
         channel change.
+
+        The decoder is reset *through* :meth:`_reset_decoder`, which serialises on
+        the same lock the decode loop takes around ``push_iq``. Resetting from the
+        GUI thread while the decode thread is inside the decoder was a data race
+        on the demodulator's internal state -- the frame lock only ever guarded
+        the published frame, never the decoder, so it was not protecting the
+        thing that needed protecting.
         """
-        self.decoder.reset()
+        self._reset_decoder()
         with self._lock:
             self._frame = None
+            self._published_at = 0.0
         self.stats.locked_frames = 0
         self.stats.sync_quality = 0.0
+
+    def _reset_decoder(self) -> None:
+        """Run ``decoder.reset()`` with exclusive use of the decoder."""
+        with self._decoder_lock:
+            self.decoder.reset()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -239,12 +318,30 @@ class DecodeWorker:
             t_dec = time.perf_counter()
             self.stats.drain_ms = self.stats.drain_ms * 0.9 + (t_dec - t0) * 1000.0 * 0.1
             if iq.size < 64:
+                # No samples at all. This is the "receiver stopped" path, and it
+                # used to be the one path that did nothing: it skipped the
+                # no-lock bookkeeping entirely, so a source that delivered
+                # nothing left the previous frame and the previous "locked" status
+                # standing. The accounting below is what makes a dead receiver
+                # look dead, so it has to run here too.
+                self._count_missed_fields()
                 self._stop.wait(0.004)
                 t0 = time.perf_counter()
                 continue
             try:
-                frame = self.decoder.push_iq(iq)
-            except Exception:  # keep the pipeline alive on a bad chunk
+                with self._decoder_lock:
+                    frame = self.decoder.push_iq(iq)
+            except Exception as exc:  # keep the pipeline alive on a bad chunk
+                # Swallowed silently before, which turned a repeating programming
+                # error into indistinguishable "loss of video": the frame counter
+                # simply stopped, and the app looked like a receiver fault. Now
+                # it is counted and the first few are recorded, so a decode bug
+                # is visible as a decode bug.
+                self.stats.decode_errors += 1
+                if self.stats.decode_errors <= 3:
+                    self.stats.last_decode_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 frame = None
             self.stats.decode_ms = (
                 self.stats.decode_ms * 0.9 + (time.perf_counter() - t_dec) * 1000.0 * 0.1
@@ -254,18 +351,18 @@ class DecodeWorker:
             if frame is not None:
                 with self._lock:
                     self._frame = frame
+                    self._published_at = time.monotonic()
                 self.stats.frames += 1
                 self.stats.locked_frames += 1
                 self.stats.last_frame_at = time.monotonic()
                 self.stats.line_rate_hz = frame.line_rate_hz
                 self.stats.sync_quality = frame.sync_quality
                 self.stats.standard = frame.standard
+                self.stats.lines_from_grid = frame.lines_from_grid
                 self._last_decode = time.monotonic()
             elif time.monotonic() - self._last_decode > 0.5:
                 # no lock for half a second: count the fields we could not use
-                elapsed = time.monotonic() - max(self._last_decode, self.stats.started_at)
-                self.stats.fields_missed += max(0, int(elapsed / self._field_interval) - self.stats.locked_frames)
-                self._last_decode = time.monotonic()
+                self._count_missed_fields()
 
             # Pace the whole iteration to the field rate; decoding faster than
             # real time is pointless, and the wait is what keeps the ring from
@@ -289,3 +386,20 @@ class DecodeWorker:
             now = time.perf_counter()
             self.stats.cycle_ms = self.stats.cycle_ms * 0.9 + (now - t0) * 1000.0 * 0.1
             t0 = now
+
+    def _count_missed_fields(self) -> None:
+        """Account for a stretch during which no field could be locked.
+
+        Shared by the "no samples" and "samples but no lock" paths, because both
+        mean the same thing -- nothing usable arrived -- and the "no samples"
+        path used to skip this entirely, which is what let a dead receiver keep
+        reporting healthy-looking counters and a "locked" status.
+        """
+        now = time.monotonic()
+        if now - self._last_decode <= 0.5:
+            return
+        elapsed = now - max(self._last_decode, self.stats.started_at)
+        self.stats.fields_missed += max(
+            0, int(elapsed / self._field_interval) - self.stats.locked_frames
+        )
+        self._last_decode = now

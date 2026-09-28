@@ -170,9 +170,21 @@ class AlertEngine:
         """Fold one scan result in and return whatever is worth alerting on.
 
         ``None`` means "the search did not complete or found nothing" and is
-        treated as an empty observation -- *not* as "everything is gone". A scan
-        that was cancelled halfway through has not proved anything, and reporting
-        a dozen "lost" events for channels it never got to would be a lie.
+        treated as an empty observation -- *not* as "everything is gone".
+
+        An incomplete search is also not an empty observation, and this used to
+        treat it as one. A cancelled scan, or one that failed, still went through
+        the expiry pass with whatever candidates it had managed to collect --
+        which for a cancelled search is usually none, because the cancellation
+        arrived before the interesting part. Everything previously known was
+        therefore "not seen this round", aged past the forget interval, and
+        reported as LOST. The operator was told their transmitter had gone at the
+        moment they pressed Cancel. The docstring above promised exactly the
+        opposite of what the code did.
+
+        So an incomplete result reports what it saw and expires nothing.
+        Absence has to be *observed* to be reported, and a search that did not
+        finish has observed nothing.
         """
         now = self.clock() if at is None else at
         with self._lock:
@@ -180,7 +192,15 @@ class AlertEngine:
             if result is None:
                 return []
             self.active = list(result.candidates)
-            return self._fold(now, result.candidates)
+            complete = not (result.stopped_early or result.error)
+            if not complete:
+                # Still report anything genuinely found -- the part of the band
+                # that was swept before the stop is real knowledge -- but do not
+                # conclude anything from the part that was not.
+                events = self._fold(now, result.candidates, expire=False)
+                return events
+            return self._fold(now, result.candidates, expire=True,
+                              span=(result.lo_hz, result.hi_hz))
 
     def note(self, cand: Candidate, at: float | None = None) -> AlertEvent | None:
         """Alert on a single finding, e.g. a channel the operator picked.
@@ -188,14 +208,29 @@ class AlertEngine:
         Goes through the same key and cooldown machinery as a scan, so watching
         a fixed channel produces one alert and a repeat count rather than a
         banner that never goes away.
+
+        Only for a candidate that is actually occupied. The alert engine alerts
+        on presence, so handing it a NOISE candidate produced a FOUND event --
+        banner, log line and beep -- for a channel with nothing on it. Callers
+        that want to *display* an assessment of a quiet channel should show it
+        without this.
         """
+        if not cand.reading.occupied:
+            return None
         now = self.clock() if at is None else at
         with self._lock:
             self.active = [cand]
-            events = self._fold(now, [cand])
+            events = self._fold(now, [cand], expire=False)
         return events[0] if events else None
 
-    def _fold(self, now: float, cands: Iterable[Candidate]) -> list[AlertEvent]:
+    def _fold(
+        self,
+        now: float,
+        cands: Iterable[Candidate],
+        *,
+        expire: bool = True,
+        span: tuple[int, int] | None = None,
+    ) -> list[AlertEvent]:
         events: list[AlertEvent] = []
         matched: set[str] = set()
 
@@ -219,12 +254,33 @@ class AlertEngine:
         # Anything we are not seeing this round, long enough gone, is lost.
         # One loop, not two: an earlier version forgot stale keys first and then
         # looked for them, so the lost event could never fire.
-        for key, (first, last, raised, count, cand) in list(self._seen.items()):
-            if key in matched or now - last < self.forget_s:
-                continue
-            del self._seen[key]
-            if raised >= 0:
-                events.append(self._make(AlertKind.LOST, now, key, cand, count))
+        #
+        # Two conditions before a finding may be declared lost, and both are
+        # about what was actually observed:
+        #
+        #   * ``expire`` is False, because the caller is folding in a search that
+        #     did not finish. Absence has to be observed before it can be
+        #     reported, and a cancelled search observed nothing.
+        #   * the finding's frequency is inside the span that was searched.
+        #     Sweeping Raceband says nothing whatsoever about an F4 at 5740 MHz,
+        #     and the previous version aged it out anyway -- so scoping a search,
+        #     which is the thing that makes a search fast, silently deleted the
+        #     operator's other findings.
+        if expire:
+            for key, (first, last, raised, count, cand) in list(self._seen.items()):
+                if key in matched or now - last < self.forget_s:
+                    continue
+                if span is not None and not (
+                    span[0] <= cand.frequency_hz <= span[1]
+                ):
+                    # Out of scope this round: not seen, but not looked for.
+                    # Refresh the sighting time so it cannot age out purely from
+                    # being outside a series of narrow searches.
+                    self._seen[key] = (first, now, raised, count, cand)
+                    continue
+                del self._seen[key]
+                if raised >= 0:
+                    events.append(self._make(AlertKind.LOST, now, key, cand, count))
 
         self._emit(events)
         return events
@@ -391,13 +447,24 @@ class Beeper:
         return True
 
     def pattern(self, events: list[AlertEvent]) -> int:
-        """Sound for a batch of new alerts. Returns how many tones were made."""
+        """Sound for a batch of new alerts. Returns how many tones were made.
+
+        The first event is counted as a tone whether or not :meth:`beep` sounds
+        it. It used to be written as ``if i == 0 or self.beep(ev.kind)``, where
+        short-circuit evaluation means the ``i == 0`` case never calls ``beep``
+        at all -- so a batch of one, which is the common case, was counted as
+        having made a tone and made silence. A helper that reports a sound it
+        did not produce is worse than one that reports nothing.
+        """
         if not events:
             return 0
         n = 0
         for i, ev in enumerate(events):
-            # One tone per event, but only if they are far enough apart in time
-            # to be heard as separate events.
-            if i == 0 or self.beep(ev.kind):
+            if i == 0:
+                # A leading tone is wanted whatever the coalescing window says,
+                # otherwise a lone alert is the one alert that stays silent.
+                self.beep(ev.kind)
+                n += 1
+            elif self.beep(ev.kind):
                 n += 1
         return n

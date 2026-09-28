@@ -123,6 +123,9 @@ def scan_span(
     if not fast_ok(source):
         return by_hops(why_not_fast(source))
 
+    if not fast_ok(source):
+        return by_hops(why_not_fast(source))
+
     say("lending the radio to the sweep tool", 0.0)
     if not source.release_device():
         # A radio that will not let go is not a dead end, because the hop walk
@@ -130,9 +133,32 @@ def scan_span(
         # Falling back is both the fast thing and the honest one; reporting an
         # error here would be wrong twice over, since the answer the operator
         # wants is still obtainable.
+        #
+        # Take the radio back before handing over. A release that returns False
+        # may still have torn down the reader, and leaving the source released
+        # would suppress process spawning for the fallback that follows -- which
+        # is the same defect this function used to have on the *successful*
+        # release path.
+        source.reclaim_device()
         return by_hops("the radio would not let go for a sweep")
+
+    # -- the sweep, with no control flow that returns from inside ------------
+    #
+    # Everything below used to be wrapped in try/finally with the fallback
+    # written as ``return by_hops(...)``. That was the bug, and it was a quiet
+    # one: a return expression is evaluated *before* its finally block runs, so
+    # the entire hop-walk fallback executed while the source was still released.
+    # A released source refuses to spawn, so every hop waited out its settle
+    # timeout and then read whatever was left in the ring -- one pre-scan
+    # capture, re-reported at 34 different frequencies. The operator saw a
+    # complete, confident, entirely fabricated result.
+    #
+    # So the sweep is attempted into a value, the radio is handed back, sample
+    # flow is confirmed, and only then is any other engine allowed to run.
+    sweep_res: scan.ScanResult | None = None
+    why = ""
+    say("sweeping", 0.1)
     try:
-        say("sweeping", 0.1)
         tr = sweep.run_sweep(
             lo_hz, hi_hz, sweeps=sweeps,
             # Snap to what the tool can actually ask for. The sweep tool takes
@@ -143,10 +169,13 @@ def scan_span(
             cancel=cancel,
         )
         if tr.error == "cancelled" or (cancel is not None and cancel.is_set()):
-            res = sweep.result_from_trace(tr)
-            res.engine = "sweep"
-            return res
-        if not tr.ok:
+            sweep_res = sweep.result_from_trace(tr)
+            sweep_res.engine = "sweep"
+        elif tr.ok:
+            say("reading the trace", 0.8)
+            sweep_res = sweep.result_from_trace(tr)
+            sweep_res.engine = "sweep"
+        else:
             # The sweep could not have the radio. This is common rather than
             # exceptional on a HackRF: the handover means killing a process
             # that is mid-transfer, and the device then refuses the next open
@@ -155,21 +184,62 @@ def scan_span(
             # not to report a failure the operator cannot act on, but to go and
             # get the answer by the route that still works. The hop walk drives
             # the radio we already hold, so it is unaffected.
-            #
-            # Reported through the status line rather than left in ``error``:
-            # the result is a good one, and marking it failed would be a lie in
-            # the other direction -- it would train the operator to ignore
-            # errors that matter.
-            return by_hops(f"the sweep could not use the radio ({tr.error})")
-        say("reading the trace", 0.8)
-        res = sweep.result_from_trace(tr)
-        res.engine = "sweep"
-        return res
-    finally:
-        if not source.reclaim_device():
-            # Surfaced rather than swallowed: the picture is now frozen, and
-            # the operator deserves to know the radio did not come back.
-            say("the radio did not come back after the sweep", 1.0)
+            why = f"the sweep could not use the radio ({tr.error})"
+    except Exception as exc:                    # noqa: BLE001 - never abandon
+        why = f"the sweep failed ({exc})"
+
+    # -- the radio comes back, and must actually deliver -------------------
+    if not source.reclaim_device():
+        # Surfaced rather than swallowed, and not papered over with a fallback:
+        # with no radio there is no other engine to fall back to, and running
+        # one would manufacture a result out of nothing. "I could not receive
+        # anything" and "the band is empty" are different facts, and only one of
+        # them is true.
+        say("the radio did not come back after the sweep", 1.0)
+        return _acquisition_failure(lo_hz, hi_hz, why or
+                                    "the radio did not come back after the sweep")
+
+    if sweep_res is not None:
+        return sweep_res
+
+    # Confirm the source is live before asking it to measure 34 hops. Normally
+    # this is satisfied in a few milliseconds, because reclaim respawns the
+    # transfer process; the wait is here so a radio that reopens but never
+    # delivers is reported as such instead of as a quiet band.
+    if not source.wait_for_bytes(4 * RECLAIM_FLOW_BYTES, timeout=RECLAIM_FLOW_TIMEOUT):
+        return _acquisition_failure(
+            lo_hz, hi_hz,
+            f"{why}; the radio reopened but delivered no samples, so the band "
+            f"was not measured",
+        )
+
+    return by_hops(why)
+
+
+#: Bytes asked for when checking that a reclaimed radio is really delivering.
+#: Small on purpose: this is a liveness check, not a measurement, and it runs on
+#: the fallback path where the operator is already waiting.
+RECLAIM_FLOW_BYTES = 2_000
+
+#: Bound on that check. A live radio at 10 MS/s delivers 20 MB/s, so this is
+#: roughly 0.4 ms of signal; anything slower is a dead pipe, not slow data.
+RECLAIM_FLOW_TIMEOUT = 1.5
+
+
+def _acquisition_failure(lo_hz: int, hi_hz: int, why: str) -> scan.ScanResult:
+    """A result that says "not measured", never "nothing there".
+
+    Without this the app has two ways to report an empty band, and it was
+    reaching for the wrong one: a receiver that was never delivering produced a
+    confident "nothing above the noise floor", which is indistinguishable from a
+    genuinely quiet band and actively misleading. The distinction is carried in
+    ``error``, which the UI already surfaces, and in the absence of candidates.
+    """
+    res = scan.ScanResult(lo_hz=int(lo_hz), hi_hz=int(hi_hz))
+    res.error = f"band search could not run: {why}"
+    res.stopped_early = True
+    res.engine = "none"
+    return res
 
 
 def _snap_lna(db: int) -> int:
