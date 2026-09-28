@@ -64,7 +64,10 @@ def why_not_fast(source: sdr.IQSource) -> str:
     """Why the slow engine is in use, in a sentence."""
     if not getattr(source, "exclusive_use", False):
         return f"{NO_SWEEP}: {source.kind} holds no radio to lend out"
-    return sweep.unavailable_reason()
+    # Empty would mean nothing is wrong, which cannot be true on this path --
+    # fast_ok() already said no. Kept as a belt-and-braces default so this
+    # cannot return an empty reason and leave the status line blank.
+    return sweep.unavailable_reason() or f"{NO_SWEEP} for an unknown reason"
 
 
 def scan_span(

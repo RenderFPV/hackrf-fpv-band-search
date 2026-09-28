@@ -59,9 +59,14 @@ BUILD = ROOT / "build"
 #: usual case once someone has put it there deliberately.
 sys.path.insert(0, str(ROOT))
 from fpv_rf.sdr import find_hackrf_transfer  # noqa: E402
+from fpv_rf.sweep import find_sweep_tool  # noqa: E402
 
 _found_transfer = find_hackrf_transfer()
 HACKRF_TRANSFER = Path(_found_transfer) if _found_transfer else None
+
+#: The fast search engine's helper, for the same reason and found the same way.
+_found_sweep = find_sweep_tool()
+HACKRF_SWEEP = Path(_found_sweep) if _found_sweep else None
 
 #: Qt ships far more than this program uses. Only Core, Gui and Widgets are
 #: imported, so everything else is dead weight -- and the big offenders (QtWebEngine
@@ -176,6 +181,26 @@ def main() -> int:
         dest = out_dir / HACKRF_TRANSFER.name
         shutil.copy2(HACKRF_TRANSFER, dest)
         print(f"copied the radio helper to {dest.name}")
+
+    # The sweep tool travels too, or the packaged app is stuck on the hop walk
+    # for everyone who has not already got a Mayhem utils folder on the desktop.
+    # It is the whole 0.14 s versus 12.5 s difference, so shipping the app
+    # without it would quietly ship the slow version.
+    #
+    # FFTW is deliberately not shipped: libfftw3f-3.dll is GPL, and this project
+    # is MIT. sweep.find_fftw() looks for a suitable build on the user's machine
+    # and stages a copy at runtime; when it finds none, the app says the fast
+    # path is unavailable and uses the hop walk, which is a working app rather
+    # than a broken one.
+    if HACKRF_SWEEP is not None and HACKRF_SWEEP.exists():
+        dest = out_dir / HACKRF_SWEEP.name
+        shutil.copy2(HACKRF_SWEEP, dest)
+        print(f"copied the sweep helper to {dest.name}")
+    else:
+        print("warning: hackrf_sweep.exe was not found, so the packaged app\n"
+              "         will use the hop walk (12.5 s) instead of the sweep\n"
+              "         (0.14 s). Copy it next to the exe to fix that.",
+              file=sys.stderr)
 
     size = sum(f.stat().st_size for f in out_dir.rglob("*") if f.is_file())
     print(f"\n{exe}")

@@ -316,7 +316,16 @@ def available() -> bool:
 
 
 def unavailable_reason() -> str:
-    """Why not, in words a person can act on."""
+    """Why not, in words a person can act on. Empty when there is nothing wrong.
+
+    The empty-when-fine case is not decoration. The first version had no such
+    branch and fell through to "did not start on this machine", so asking the
+    question when the answer was yes produced a confident falsehood -- which is
+    worse than no answer, because a caller cannot tell it from a real fault.
+    Callers should test the string, not just print it.
+    """
+    if available():
+        return ""
     if find_sweep_tool() is None:
         return (
             "hackrf_sweep.exe not found. It ships in the Mayhem firmware's "
