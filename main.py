@@ -19,6 +19,15 @@ from fpv_rf import bands, sdr  # noqa: E402
 
 LOG_NAME = "fpv-rf.log"
 
+#: Samples ``--check`` wants in the snapshot it assesses, and the minimum it will
+#: accept as a pass. The pair is deliberately far apart: the snapshot is what the
+#: verdict is computed from, the minimum is what counts as "this source works".
+#:
+#: How long it waits for that snapshot is the third number, below.
+CHECK_SNAPSHOT_SAMPLES = 1_000_000
+CHECK_MIN_SAMPLES = 100_000
+CHECK_READY_TIMEOUT_S = 3.0
+
 
 class _Tee(io.TextIOBase):
     """Write to a stream *and* to a log file, tolerating either being absent.
@@ -228,6 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"source: {source.describe()}")
     print(f"retunable: {source.retunable}   "
           f"search span: {bands.format_mhz(lo)} - {bands.format_mhz(hi)}")
+
+    # Ahead of the radio gate below, and only ahead of it. The self test builds
+    # the window against the simulator and never opens a radio, so it is exactly
+    # the check that is *most* useful on a machine with no hardware -- and it
+    # used to be unreachable there, because the gate below returned 3 first.
+    # That made a helper-less build box report a missing radio and nothing else,
+    # when the one question it could still answer was whether the app works.
+    # Nothing else moves: the default mode, the frozen default and the --check
+    # path are untouched, and a real run still needs a radio.
+    if args.selftest:
+        return _selftest()
+
     if args.mode == "hackrf" and not source.available():
         print("hackrf_transfer.exe was not found", file=sys.stderr)
         _alert_box(
@@ -241,9 +262,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return _check(source)
-
-    if args.selftest:
-        return _selftest()
 
     from fpv_rf import ui
 
@@ -263,7 +281,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _check(source: sdr.IQSource) -> int:
-    """Start the source, prove it produces usable IQ, and report."""
+    """Start the source, prove it produces usable IQ, and report.
+
+    Readiness is waited for rather than assumed, bounded by
+    :data:`CHECK_READY_TIMEOUT_S`, and the only evidence accepted is samples in
+    the ring. A transfer process that is merely alive is not proof of IQ -- that
+    is what a slow open looks like from here, and it is what the fixed sleep
+    this replaced used to mistake for a radio producing nothing.
+    """
     import io
     import time
 
@@ -278,13 +303,58 @@ def _check(source: sdr.IQSource) -> int:
         print(line)
         report.write(line + "\n")
 
-    source.start()
-    time.sleep(0.5)
+    # Everything the source owns is inside the try, starting with ``start()``.
+    # The wait below is the widest window here -- up to
+    # :data:`CHECK_READY_TIMEOUT_S` seconds of a console python in which a
+    # Ctrl-C lands and unwinds straight past a ``stop()`` that sat above the
+    # try -- and an interrupted check that leaked the receiver process, its
+    # sampling thread and the 1 ms system timer it holds is the worst outcome
+    # the check has: the operator is told nothing at all, and the USB handle
+    # stays open so the next run cannot open the radio. ``IQSource.stop`` is
+    # idempotent, so the single ``finally`` below is enough for every path --
+    # pass, failure verdict, exception, and interrupt alike.
     try:
+        source.start()
+        t0 = time.monotonic()
+        # Wait for the snapshot to actually exist, bounded, instead of assuming
+        # it does. The old spelling was a flat ``time.sleep(0.5)``, which is a
+        # guess about how long a source takes to start: on hardware that guess
+        # is wrong whenever the startup is slower than half a second, and
+        # starting a HackRF is routinely that slow -- the transfer helper's help
+        # text is probed before the receiver is even spawned, and in a frozen
+        # build that probe alone cost 0.66 s. The check then read an empty ring
+        # and reported zero samples with no error anywhere, which says "the
+        # radio produced nothing" rather than "nothing had arrived yet", and is
+        # exactly the wrong thing to tell someone holding a working receiver.
+        #
+        # Bounded, because the opposite failure is real too: a source that will
+        # never produce anything must still be reported, promptly, as the
+        # failure it is. And only bytes count -- see the loop.
+        snapshot_bytes = CHECK_SNAPSHOT_SAMPLES * 2
+        base = source.ring.write_position()
+        deadline = time.monotonic() + CHECK_READY_TIMEOUT_S
+        while source.ring.total_written - base < snapshot_bytes:
+            # Not "is it running". A live transfer process is not proof of IQ --
+            # it is precisely the state the old sleep mistook for a dead radio,
+            # so treating it as readiness would reproduce the same wrong
+            # verdict.
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        startup_s = time.monotonic() - t0
         st = source.stats
-        iq = source.take_iq(1_000_000)
-        if iq.size < 100_000:
+        iq = source.take_iq(CHECK_SNAPSHOT_SAMPLES)
+        if iq.size < CHECK_MIN_SAMPLES:
             say(f"FAIL: source produced only {iq.size} samples")
+            # What it waited for, and how long it waited: without these the only
+            # number an operator has is a sample count that reads like a verdict
+            # on the radio rather than a note about when we looked.
+            say(f"startup: no {CHECK_SNAPSHOT_SAMPLES} samples within "
+                f"{CHECK_READY_TIMEOUT_S:.1f}s (waited {startup_s:.2f}s)")
+            say(f"radio: transfer "
+                f"{'running' if st.running else 'not running'}, "
+                f"{st.bytes_total} bytes, {st.open_retries} open retries, "
+                f"{st.read_errors} read errors")
             say(f"last error: {st.last_error or '(none)'}")
             _alert_box("FPV RF - check failed", report.getvalue().strip())
             return 1
@@ -293,12 +363,22 @@ def _check(source: sdr.IQSource) -> int:
             f"mean |IQ| {abs(iq).mean():.3f}")
         dropped = source.ring.dropped_bytes // 2
         if dropped:
-            # Expected in this mode and not a warning: the check pulls a whole
-            # 1 Msample snapshot at once, and the ring is 2 Msamples and still
-            # filling, so the writer is guaranteed to overrun. The streaming
-            # decoder drains continuously and does not do this.
-            say(f"({dropped/1e6:.2f} Msamples overwritten while this check "
-                f"read its snapshot -- the streaming decoder does not)")
+            # Real loss: bytes the ring overwrote that this check never read.
+            # A check that stalls while a source streams will show some.
+            say(f"({dropped/1e6:.2f} Msamples overwritten without being read "
+                f"while this check was reading its snapshot)")
+        turned_over = source.ring.overwritten_bytes // 2
+        if turned_over and not dropped:
+            # Expected in this mode and not a warning, which is why it reads the
+            # history-overwrite counter and not the loss counter: the check
+            # pulls a whole 1 Msample snapshot at once and the ring is 2
+            # Msamples and still filling, so the writer is guaranteed to turn
+            # the buffer over. Every byte it turned over was read by the
+            # snapshot, so none of it was lost. The streaming decoder drains
+            # continuously and does not do this.
+            say(f"({turned_over/1e6:.2f} Msamples of ring history overwritten "
+                f"while this check read its snapshot -- the streaming decoder "
+                f"does not)")
         reading = dsp.assess_channel(iq, source.sample_rate)
         verdict = reading.describe()
         say(f"at {bands.format_mhz(source.frequency_hz)}: {verdict}")

@@ -124,10 +124,24 @@ def supported_flags(executable: str) -> frozenset[str]:
     A probe that fails yields the empty set, which means "pass nothing
     optional" -- the safe direction, since every optional flag here is a
     refinement rather than a requirement.
+
+    ``CREATE_NO_WINDOW`` is not tidiness, it is the reason this probe is not
+    free. It runs on the startup path -- :meth:`HackrfSource._cmdline` asks for
+    the flag set while building the *receive* command line -- so it happens
+    before the first sample can exist. A console-subsystem child launched from
+    the windowed frozen exe cost ~0.66 s here, against ~0.024 s under console
+    python and ~0.030 s with this flag set: that is the whole of the "the
+    radio produced nothing" delay, and it was charged to the radio rather than
+    to the probe. The receiver itself is spawned with the same flag for the
+    same reason; see :meth:`HackrfSource._spawn`.
     """
     try:
         r = subprocess.run(
-            [executable, "-h"], capture_output=True, text=True, timeout=10
+            [executable, "-h"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
         return frozenset()
@@ -225,7 +239,31 @@ class IQRing:
     The reader thread appends; the decoder takes the newest ``n`` bytes as one
     contiguous copy. On overflow the *oldest* data is discarded, because for a
     live view stale video is worse than a dropped frame.
+
+    Every write is stamped with the id of the tuning that produced it, and the
+    position at which that id changed is remembered. That is what lets a
+    consumer be told whether the block it was handed straddles a retune: an FM
+    discriminator carries state from one sample to the next, so a block holding
+    the tail of one frequency and the head of another cannot be demodulated as
+    one continuous stream, and no consumer can tell from the bytes alone.
+
+    **Two different things are counted, because they mean different things.**
+    The ring is a 4 MiB history buffer and a decoder that has been running for
+    a minute has, necessarily, pushed most of that out of the back -- the ring
+    holds only the last couple of seconds, and every byte after it was read by
+    the decoder and is not lost at all. That is :attr:`overwritten_bytes`, and
+    it is the expected steady state of a working stream. :attr:`dropped_bytes`
+    counts only the bytes that went out of the back *without any consumer ever
+    having been offered them* -- real loss, the thing an operator is reading the
+    counter to find out about. They used to be one number, and a healthy stream
+    reported tens of megabytes of "loss" every second, which is both useless as
+    a fault signal and a standing invitation to ignore the field.
     """
+
+    #: How many tuning transitions are remembered. Only one ring's worth of
+    #: history can ever be read back, so this is a bound on how many retunes
+    #: can happen inside a single decode block, not a growing log.
+    TAG_HISTORY = 64
 
     def __init__(self, size: int = RING_BYTES) -> None:
         self._buf = bytearray(size)
@@ -233,16 +271,53 @@ class IQRing:
         self._wpos = 0
         self._count = 0
         self._lock = threading.Lock()
+        #: Bytes destroyed by an overrun that no consumer had read. What an
+        #: operator means by "dropped samples".
         self.dropped_bytes = 0
+        #: Bytes pushed out of the ring's history, read or not. The ring is a
+        #: rolling buffer; this grows on a perfectly healthy stream and only
+        #: means "the buffer turned over", which is what it now says.
+        self.overwritten_bytes = 0
+        #: Absolute position up to which some consumer has taken delivery. Not
+        #: advanced by writes: it is the reader's promise, so the ring can tell
+        #: which of the bytes it is discarding were never offered to anybody.
+        self._read_upto = 0
         self.total_written = 0
+        #: ``(byte position, tuning id)``, ascending, recording where each
+        #: tuning started writing. Positions are absolute, so they mean the same
+        #: thing as ``total_written``.
+        self._tags: list[tuple[int, int]] = []
 
-    def write(self, data: bytes | memoryview) -> int:
+    def _mark_read_locked(self, upto: int) -> None:
+        """Record that a consumer has taken delivery up to ``upto``. Lock held."""
+        if upto > self._read_upto:
+            self._read_upto = int(upto)
+
+    def _loss_locked(self, oldest: int, lost: int) -> int:
+        """Of ``lost`` bytes leaving the ring at ``oldest``, how many were unread.
+
+        Caller holds the lock. The bytes discarded are the oldest ones, and the
+        unread ones are the newest, so the two overlap only when the overrun
+        reaches past everything a consumer has taken -- which is exactly the
+        case that is genuine loss.
+        """
+        if lost <= 0:
+            return 0
+        return max(
+            0,
+            min(oldest + lost, self.total_written) - max(oldest, self._read_upto),
+        )
+
+    def write(self, data: bytes | memoryview, tune_id: int = 0) -> int:
         n = len(data)
         with self._lock:
             if n > self._size:
-                # Far more than we can hold; keep only the tail.
-                self.dropped_bytes += n - (self._size // 2)
-                data = memoryview(data)[n - (self._size // 2) :]
+                # Far more than we can hold; keep only the tail. The head is
+                # gone before any consumer could have seen any of this write.
+                keep = n - (self._size // 2)
+                self.dropped_bytes += keep
+                self.overwritten_bytes += keep
+                data = memoryview(data)[keep:]
                 n = len(data)
             pos = self._wpos
             end = pos + n
@@ -255,8 +330,18 @@ class IQRing:
             self._wpos = end % self._size
             if self._count + n > self._size:
                 over = self._count + n - self._size
-                self.dropped_bytes += over
+                # Absolute position of the oldest byte still in the ring,
+                # which is the start of the run about to be overwritten.
+                oldest = self.total_written - self._count
+                self.dropped_bytes += self._loss_locked(oldest, over)
+                self.overwritten_bytes += over
             self._count = min(self._count + n, self._size)
+            # Recorded before the counter moves, because the seam belongs to the
+            # first byte of *this* write, not the one after it.
+            if not self._tags or self._tags[-1][1] != tune_id:
+                self._tags.append((self.total_written, tune_id))
+                floor = self.total_written - self._size
+                self._tags = [t for t in self._tags if t[0] >= floor][-self.TAG_HISTORY :]
             self.total_written += n
         return n
 
@@ -264,18 +349,79 @@ class IQRing:
         with self._lock:
             return self._count
 
-    def read_newest(self, n: int) -> bytearray:
-        """Newest ``n`` bytes, oldest-first. Returns fewer if that is all there is."""
+    def write_position(self) -> int:
+        """The absolute write counter, read under the ring's own lock."""
         with self._lock:
-            n = min(n, self._count)
-            if n <= 0:
-                return bytearray()
-            end = self._wpos
-            start = (end - n) % self._size
-            if start + n <= self._size:
-                return bytearray(self._buf[start : start + n])
-            first = self._size - start
-            return bytearray(self._buf[start:] + self._buf[: n - first])
+            return self.total_written
+
+    def _newest_locked(self, n: int) -> bytearray:
+        """Newest ``n`` bytes, oldest-first. Caller holds the lock."""
+        n = min(n, self._count)
+        if n <= 0:
+            return bytearray()
+        end = self._wpos
+        start = (end - n) % self._size
+        if start + n <= self._size:
+            return bytearray(self._buf[start : start + n])
+        first = self._size - start
+        return bytearray(self._buf[start:] + self._buf[: n - first])
+
+    def _tag_at(self, pos: int) -> int:
+        """The tuning that was in effect at byte position ``pos``. Lock held."""
+        if not self._tags:
+            return 0
+        tag = self._tags[0][1]
+        for p, t in self._tags:
+            if p > pos:
+                break
+            tag = t
+        return tag
+
+    def read_newest(self, n: int) -> bytearray:
+        """Newest ``n`` bytes, oldest-first. Returns fewer if that is all there is.
+
+        A snapshot read, so it counts as consumption for the loss accounting:
+        whatever the caller looked at, it is not going to be asked for again,
+        and an overrun that destroys it has not destroyed anything anybody was
+        waiting on.
+        """
+        with self._lock:
+            data = self._newest_locked(n)
+            if data:
+                self._mark_read_locked(self.total_written)
+            return data
+
+    def read_since(
+        self, cursor: int, max_bytes: int
+    ) -> tuple[bytearray, int, int, int]:
+        """Unconsumed bytes since ``cursor``, with everything a consumer needs.
+
+        Returns ``(data, new_cursor, first_tune_id, last_tune_id)``.
+
+        All four come out of *one* acquisition of the lock, and that is the whole
+        point of the method existing. The previous shape of this was two calls:
+        read the write counter, then read the data. A write landing between them
+        was counted as consumed by the first call and never handed over by the
+        second -- samples lost, silently, on a live stream.
+
+        The new cursor is the write position observed under that same lock, so
+        whatever was written while this block was being copied is *not* counted
+        as consumed and comes round on the next call. A backlog longer than
+        ``max_bytes`` is consumed and dropped, as documented on
+        :meth:`IQSource.drain_iq`.
+        """
+        with self._lock:
+            written = self.total_written
+            pending = max(0, written - int(cursor))
+            n = min(pending, max(0, int(max_bytes)))
+            data = self._newest_locked(n)
+            # The consumer's new cursor is the write position observed under
+            # this same lock, so everything up to it is either in ``data`` or
+            # deliberately skipped -- either way it has been dealt with and an
+            # overrun must not count it again as data nobody read.
+            self._mark_read_locked(written)
+            first_pos = written - len(data)
+            return data, written, self._tag_at(first_pos), self._tag_at(written)
 
 
 # --------------------------------------------------------------------------
@@ -362,6 +508,23 @@ class IQEncoding(Enum):
 #: around; reusing it keeps the two paths amplitude-comparable instead of
 #: introducing a 0.4% discrepancy between hardware and simulator.
 _IQ_SCALE = np.float32(1.0 / 127.5)
+
+
+def u8_to_iq(
+    raw: bytes | bytearray | memoryview,
+    encoding: "IQEncoding" = IQEncoding.SIGNED_INT8,
+) -> np.ndarray:
+    """Interleaved raw I/Q bytes to normalised complex64. Public entry point.
+
+    The conversion itself is :func:`_u8_to_iq`; this is the same function under
+    a name tools are allowed to call. Offline analysis of a capture has to
+    decode it *somehow*, and the version it used to have was an open-coded copy
+    of the wrong branch of :class:`IQEncoding` -- reading a HackRF recording as
+    offset-binary, which inverts the waveform and leaves every power figure
+    looking fine. Reaching for the real one here is what keeps a diagnostic and
+    the app it is diagnosing from disagreeing about the same file.
+    """
+    return _u8_to_iq(raw, encoding)
 
 
 def _u8_to_iq(
@@ -534,6 +697,23 @@ class IQSource(ABC):
         self._thread: threading.Thread | None = None
         self._tune_lock = threading.Lock()
         self._consumed = 0
+        #: Serialises the drain cursor. The cursor is a single value read by
+        #: :meth:`drain_iq` and moved by :meth:`reset_drain`, and both run on
+        #: different threads (decoder, and a retune racing a scan). Without this,
+        #: a reset landing mid-drain moves the cursor underneath the copy in
+        #: flight and the block being returned is pre-reset data the caller
+        #: believes was post-reset.
+        self._drain_lock = threading.Lock()
+        #: Bumped on every tuning the hardware actually accepted. Stamped into
+        #: the ring with each write, so a consumer can be told that a block it
+        #: was handed straddles a retune. The discriminator carries state from
+        #: sample to sample and cannot demodulate such a block as one stream.
+        self._tune_id = 0
+        #: Tuning ids of the last :meth:`drain_iq` hand-over, for the same
+        #: reason the ids exist in the ring. Kept beside the drain rather than
+        #: returned: :meth:`drain_iq` returns samples, and every caller of it
+        #: treats that as the whole answer.
+        self.last_drain_tune_ids: tuple[int, int] = (0, 0)
         self._timer = TimerResolution()
 
     # -- lifecycle ---------------------------------------------------------
@@ -589,20 +769,11 @@ class IQSource(ABC):
     def tune(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
         """Retune. Returns True if the change is in effect on the hardware.
 
-        This is the *only* entry point, and it owns ``_tune_lock`` for the whole
-        operation. Subclasses implement ``_apply_tune`` and must not take the
-        lock again: it is a plain ``Lock``, so re-acquiring it on the same
-        thread blocks forever.
-
-        Two things this gets right that a naive version does not.
-
-        *Requested* state is committed only after the hardware agrees. The
-        frequency is remembered separately in ``_applied_hz``, and a failed
-        apply leaves the requested value in place so a retry can actually
-        retry. The previous version wrote ``frequency_hz`` first and returned
-        the apply result, which meant a failure corrupted the reported state and
-        the next identical request took the early return and reported success
-        without touching the radio at all.
+        Public entry point: it takes ``_tune_lock`` and delegates to
+        :meth:`_tune_locked`. The lock covers the whole operation because the
+        apply talks to a child process, and two overlapping tunes would race for
+        it -- the loser's frequency would be reported while the winner's
+        configuration was on the air.
 
         ``reconfigure=True`` forces a re-apply even at an unchanged frequency.
         Gains and the amplifier switch are command-line arguments to the transfer
@@ -612,22 +783,50 @@ class IQSource(ABC):
         until some unrelated later action happened to restart reception.
         """
         with self._tune_lock:
-            want = int(frequency_hz)
-            if (want == self.frequency_hz and not reconfigure
-                    and self._applied_hz == want):
-                return True
-            self.frequency_hz = want
-            if not self._apply_tune():
-                return False
-            # Recorded here rather than in each subclass, because several of them
-            # legitimately short-circuit -- before the reader thread exists, or
-            # while the device is lent to the sweep tool -- and a subclass that
-            # forgets to set this would make tune() report a failure that never
-            # happened. While released this is a promise about the pending
-            # configuration, not about the air: reclaim_device() opens at
-            # frequency_hz, which is what this records.
-            self._applied_hz = want
+            return self._tune_locked(int(frequency_hz), reconfigure=reconfigure)
+
+    def _tune_locked(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
+        """Body of :meth:`tune`, for callers that already hold ``_tune_lock``.
+
+        Nothing here may take ``_tune_lock``: it is a plain ``Lock``, so
+        re-acquiring it on the same thread blocks forever. Subclasses that want
+        to refuse a tune override *this* rather than :meth:`tune`, for the same
+        reason :meth:`retune_settled` is written in terms of it -- overriding
+        ``tune`` alone would leave that path bypassing the refusal.
+        """
+        want = int(frequency_hz)
+        if (want == self.frequency_hz and not reconfigure
+                and self._applied_hz == want):
             return True
+        previous = self.frequency_hz
+        self.frequency_hz = want
+        if not self._apply_tune():
+            # Roll the request back to what is really on the air, so the two
+            # cannot end up out of step in the direction that cannot recover.
+            # Committing it and returning False meant the *next* identical
+            # request matched ``frequency_hz``, took the early return above and
+            # reported success without ever touching the radio: one refusal left
+            # the receiver permanently claiming a frequency it was not on.
+            # Rolling back keeps ``want != frequency_hz``, so a retry really is
+            # a retry. ``_applied_hz`` is 0 only on a source that has never
+            # applied a tune at all, and there the pre-request value is the more
+            # truthful of the two.
+            self.frequency_hz = self._applied_hz or previous
+            return False
+        # Recorded here rather than in each subclass, because several of them
+        # legitimately short-circuit -- before the reader thread exists, or
+        # while the device is lent to the sweep tool -- and a subclass that
+        # forgets to set this would make tune() report a failure that never
+        # happened. While released this is a promise about the pending
+        # configuration, not about the air: reclaim_device() opens at
+        # frequency_hz, which is what this records.
+        self._applied_hz = want
+        # Only a tuning the hardware accepted changes what is being received, so
+        # only that is a seam. A refused tune leaves the air untouched, and
+        # labelling it as a new tuning would make the decoder drop a perfectly
+        # continuous stream for no reason.
+        self._tune_id += 1
+        return True
 
     def _apply_tune(self) -> bool:
         return True
@@ -694,20 +893,24 @@ class IQSource(ABC):
 
         The cursor tracks the ring's absolute write counter, which is monotonic
         and never wraps, so there is no wraparound case to reason about. A
-        backlog larger than the ring is already gone: ``read_newest`` cannot
-        reach it, and the cursor is advanced to the present so the lost span is
-        not re-requested forever.
+        backlog larger than the ring is already gone: the read cannot reach it,
+        and the cursor is advanced to the present so the lost span is not
+        re-requested forever.
+
+        The data, the new cursor and the tuning ids of the block are read in one
+        go under the ring's lock, and recorded on :attr:`last_drain_tune_ids`.
+        That is the fix for a loss that used to be unavoidable: reading the
+        counter and then the bytes let a write landing in between be marked
+        consumed and never handed over. Doing it in two calls cannot be made
+        correct, only less likely.
         """
         want = int(max_samples) * 2
-        # Read the counter once. Checking it again after the read would let a
-        # sample written in between be counted as consumed without ever being
-        # handed over, which is the one failure mode a cursor must not have.
-        written = self.ring.total_written
-        pending = written - self._consumed
-        self._consumed = written
-        if pending <= 0:
-            return np.zeros(0, dtype=np.complex64)
-        raw = self.ring.read_newest(min(pending, want))
+        with self._drain_lock:
+            raw, written, first_id, last_id = self.ring.read_since(
+                self._consumed, want
+            )
+            self._consumed = written
+            self.last_drain_tune_ids = (first_id, last_id)
         if len(raw) < 16:
             return np.zeros(0, dtype=np.complex64)
         return _u8_to_iq(raw, self.encoding)
@@ -719,8 +922,16 @@ class IQSource(ABC):
         :meth:`drain_iq` returns nothing until genuinely new samples arrive.
         Used on retune, so a decoder cannot splice the tail of one frequency
         onto the head of the next.
+
+        Shares :attr:`_drain_lock` with :meth:`drain_iq`, and reads the counter
+        through the ring rather than touching ``total_written`` directly. A reset
+        that landed between a drain's read of the counter and its read of the
+        data moved the cursor underneath the copy already in flight, and the
+        caller received pre-reset samples believing they were post-reset -- the
+        exact splice this method exists to prevent, arriving through the seam.
         """
-        self._consumed = self.ring.total_written
+        with self._drain_lock:
+            self._consumed = self.ring.write_position()
 
     def wait_for_bytes(self, n_bytes: int, timeout: float = 2.0) -> bool:
         """Block until the ring's write counter has advanced by ``n_bytes``."""
@@ -756,17 +967,32 @@ class IQSource(ABC):
         different answers, and the scanner must be able to tell them apart --
         ``assess_frequency`` already returns None below 4096 samples, so an empty
         capture becomes "could not measure" rather than "nothing there".
+
+        The tune, the wait and the capture are one transaction, holding
+        ``_tune_lock`` throughout. They used to be three steps with the lock
+        released between them, which let a second tuner -- the sweep tool
+        restoring what it found, a UI change, another hop -- move the radio
+        before the wait, so the samples returned were the ones *that* caller
+        asked for and were scored as a measurement at this frequency. The
+        result is the same shape as before; what changed is that nothing can
+        happen in the middle of it.
         """
-        if not self.tune(int(frequency_hz)):
-            return np.zeros(0, dtype=np.complex64)
-        if not self.wait_for_bytes(n_samples * 2, timeout=timeout):
-            self.stats.read_errors += 1
-            self.stats.last_error = (
-                f"no fresh samples at {int(frequency_hz)/1e6:.1f} MHz "
-                f"within {timeout:.1f}s -- measurement discarded, not reported"
-            )
-            return np.zeros(0, dtype=np.complex64)
-        return self.take_iq(n_samples)
+        with self._tune_lock:
+            # _tune_locked, not tune(): the lock is already held here and it is
+            # a plain Lock, so re-taking it would deadlock. Routing through
+            # _tune_locked rather than reaching past it into _apply_tune also
+            # means a subclass that refuses a tune at this level -- FileSource --
+            # still refuses, instead of being bypassed by this path.
+            if not self._tune_locked(int(frequency_hz)):
+                return np.zeros(0, dtype=np.complex64)
+            if not self.wait_for_bytes(n_samples * 2, timeout=timeout):
+                self.stats.read_errors += 1
+                self.stats.last_error = (
+                    f"no fresh samples at {int(frequency_hz)/1e6:.1f} MHz "
+                    f"within {timeout:.1f}s -- measurement discarded, not reported"
+                )
+                return np.zeros(0, dtype=np.complex64)
+            return self.take_iq(n_samples)
 
 
 class HackrfSource(IQSource):
@@ -1169,12 +1395,30 @@ class HackrfSource(IQSource):
                     self._stop.wait(0.05)
                     continue
                 # Nothing is running and nobody else is starting anything: the
-                # device was unplugged, or the process died on its own. Take the
-                # lock so this cannot overlap a retune's spawn.
-                with self._tune_lock:
-                    if self._proc is None and not self._stop.is_set():
+                # device was unplugged, or the process died on its own. Attempt
+                # an opportunistic nonblocking acquisition of _tune_lock so we
+                # do not block a caller that currently holds it (e.g. retune_settled).
+                acquired = self._tune_lock.acquire(blocking=False)
+                if not acquired:
+                    # Another thread holds the lock (likely a retune in progress).
+                    # Do a short stop-aware wait and restart the outer loop,
+                    # rereading self._proc -- once a replacement has appeared,
+                    # read from it without taking the lock.
+                    self._stop.wait(0.01)
+                    continue
+                try:
+                    # _released is re-read *inside* the lock, not just by the
+                    # branch above. release_device() takes this same lock, so the
+                    # check and the spawn are now one atomic step: before, the
+                    # flag could be set after the test and before the spawn, and
+                    # this thread would take the radio straight back out of the
+                    # hands of the process it had just handed it to. That window
+                    # was the entire reason release_device() exists.
+                    if self._proc is None and not self._stop.is_set() and not self._released:
                         if not self._spawn_settled():
                             self._stop.wait(0.25)
+                finally:
+                    self._tune_lock.release()
                 p = self._proc
             if p is None or p.stdout is None:
                 self._stop.wait(0.02)
@@ -1194,7 +1438,7 @@ class HackrfSource(IQSource):
                 self._close_quietly(p.stdout)
                 self._kill(p)
                 continue
-            self.ring.write(self._view[:n])
+            self.ring.write(self._view[:n], self._tune_id)
             self.stats.bytes_total += n
         self.stats.running = False
 
@@ -1211,6 +1455,27 @@ class FileSource(IQSource):
     #: A recorded capture is one frequency. Sweeping it would report the same
     #: signal at every hop, so the scanner must be told to assess it in place.
     retunable = False
+
+    #: Bytes handed to the ring per replay iteration, and therefore the finest
+    #: granularity of the pacing below.
+    #:
+    #: The old code read a whole 1 MiB block -- 524288 complex samples, 52 ms of
+    #: a 10 MS/s stream -- pushed all of it into the ring at once, and *then*
+    #: waited out its 52 ms. The wait is what made the average rate right, and
+    #: everything else about it was wrong: the ring received 52 ms of samples
+    #: instantaneously and then nothing for 52 ms, so a consumer that takes
+    #: 175000 samples per field was always draining against a buffer that had
+    #: just been slammed full. It fell behind, and because the ring counts an
+    #: overrun as loss, every replay reported megabytes of dropped samples that
+    #: the decoder had in fact consumed -- more visibly wrong than the timing,
+    #: and it is what made this look like a fault in the ring rather than a
+    #: fault in the producer.
+    #:
+    #: 64 KiB is 32768 samples, 3.3 ms at 10 MS/s: a small fraction of a field,
+    #: fine enough that the ring is never more than a few milliseconds ahead of
+    #: the consumer, coarse enough that a syscall every 3 ms costs nothing next
+    #: to the decode it is feeding.
+    CHUNK_BYTES = 64 << 10
 
     def __init__(
         self,
@@ -1240,8 +1505,14 @@ class FileSource(IQSource):
         self._encoding_choice = encoding
         self.encoding = encoding or IQEncoding.SIGNED_INT8
         self._encoding_reason = "declared" if encoding else "not yet examined"
+        #: Set the first time :meth:`_detect_encoding` reaches a verdict, so the
+        #: file is decoded one way from its first sample to its last. Re-deciding
+        #: per block is how a recording that opens quiet and gets loud decoded
+        #: as two different waveforms, with a discontinuity at the point the
+        #: verdict flipped.
+        self._encoding_settled = encoding is not None
 
-    def tune(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
+    def _tune_locked(self, frequency_hz: int, *, reconfigure: bool = False) -> bool:
         """Refuse. A recording is one frequency and cannot become another.
 
         The base class happily stored the new value, which meant a replayed
@@ -1257,6 +1528,13 @@ class FileSource(IQSource):
         is a different operation from tuning, and it is the constructor's
         ``frequency_hz`` argument. Conflating them is what made the same file
         describe itself as two different channels.
+
+        The refusal sits at this level rather than in a ``tune`` override so that
+        every route into a tune is covered. :meth:`IQSource.retune_settled` is
+        the scan's measurement path and goes through ``_tune_locked``, so a
+        ``tune``-level override was invisible to it: sweeping a recording would
+        have gone straight to ``_apply_tune`` and reported hop results built from
+        one fixed capture.
         """
         if int(frequency_hz) != self.frequency_hz:
             return False
@@ -1281,16 +1559,27 @@ class FileSource(IQSource):
         through a replay. Detection is confined to files, where the format is
         genuinely unknown; hardware declares its own.
 
+        The "once" is enforced, not just described. This was called on every
+        block, and a block is 64 KiB of whatever the recording happens to hold --
+        so a file that opens with a quiet passage and gets loud later would be
+        declared offset-binary at the start and signed a second in, with the
+        decoder handed a discontinuity in the middle of one continuous
+        recording. Freezing the first verdict makes the file one waveform, which
+        is what a recording is.
+
         When the data is undecidable -- a loud recording, where the two encodings
         are not distinguishable -- it falls back to signed, the format the radio
         produces and the only one this app's own recordings come from, and says
         so in :meth:`describe`. A file that turns out to be offset-binary can be
-        loaded with an explicit ``encoding=``; what is not acceptable is
-        pretending the data settled it when it did not.
+        loaded with an explicit ``encoding=``, which wins over anything detected;
+        what is not acceptable is pretending the data settled it when it did not.
         """
-        if self._encoding_choice is not None:
+        if self._encoding_settled:
             return
         verdict = detect_iq_encoding(raw)
+        # Settled only now: a raise above left the flag unset, so the next chunk
+        # retries detection instead of freezing the default as "not yet examined".
+        self._encoding_settled = True
         if verdict.encoding is None:
             self.encoding = IQEncoding.SIGNED_INT8
             self._encoding_reason = f"defaulted, {verdict.reason}"
@@ -1304,33 +1593,45 @@ class FileSource(IQSource):
             return
         self.stats.running = True
         bytes_per_s = self.sample_rate * 2
+        chunk = max(2, self.CHUNK_BYTES)
+        period = chunk / bytes_per_s
+        # Paced on an absolute schedule rather than "sleep a chunk period after
+        # reading", for the reason :meth:`SimSource._run` gives: a wait that
+        # overshoots is paid again on every chunk and never washes out, so the
+        # long-run rate is quietly below real time. Advancing a deadline and
+        # simply not sleeping when it has passed makes the occasional late chunk
+        # a catch-up chunk instead of a permanently late stream.
+        deadline = time.perf_counter()
         while not self._stop.is_set():
             with open(self.path, "rb", buffering=0) as fh:
                 while not self._stop.is_set():
-                    want = min(len(self._block_view()), RING_BYTES)
                     t0 = time.monotonic()
-                    data = fh.read(want)
+                    data = fh.read(chunk)
                     if not data:
                         break
                     # Decide the format before the first byte reaches the ring,
                     # so the file is decoded consistently from end to end rather
                     # than switching convention partway through a replay.
                     self._detect_encoding(data)
-                    self.ring.write(data)
+                    self.ring.write(data, self._tune_id)
                     self.stats.bytes_total += len(data)
                     if self.realtime:
-                        target = len(data) / bytes_per_s
-                        delay = target - (time.monotonic() - t0)
-                        if delay > 0:
-                            self._stop.wait(delay)
+                        deadline += period
+                        now = time.monotonic()
+                        if deadline < now - period:
+                            deadline = now        # fell a whole period behind
+                        slack = deadline - now
+                        if slack > 0.0005:
+                            self._stop.wait(slack)
+                    else:
+                        # --fast-file: no pacing, but re-reading the file in a
+                        # tight loop would spin a core with nothing throttled,
+                        # starving the decoder thread of the GIL. wait(0) just
+                        # yields the timeslice and keeps full throughput.
+                        self._stop.wait(0)
             if not self.loop:
                 break
         self.stats.running = False
-
-    def _block_view(self) -> bytearray:
-        if not hasattr(self, "_blk"):
-            self._blk = bytearray(1 << 20)
-        return self._blk
 
 
 class SimSource(IQSource):
@@ -1647,7 +1948,7 @@ class SimSource(IQSource):
             # the cost is paid once per retune, not once per block.
             if self.frequency_hz != freq_at_start:
                 continue
-            self.ring.write(u8.tobytes())
+            self.ring.write(u8.tobytes(), self._tune_id)
             self.stats.bytes_total += u8.size
             # Pace to real time, allowing for what generation actually cost.
             # Waiting a flat n/fs *after* generating would hold the source below

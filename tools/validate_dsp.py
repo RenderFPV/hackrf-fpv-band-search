@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpv_rf import dsp  # noqa: E402
+from fpv_rf import dsp, sdr  # noqa: E402
 from _paths import CAPTURE  # noqa: E402
 
 DEFAULT = CAPTURE  # noqa: F821  (from _paths, below)
@@ -21,11 +21,25 @@ OUT = Path(__file__).resolve().parents[1] / "_validate_out"
 
 
 def load_u8(path: Path, max_samples: int) -> np.ndarray:
+    """Interleaved uint8 capture file to complex64, the way the app reads one.
+
+    This used to open-code the conversion: read the bytes, subtract 127.5 from
+    every one of them, and call the result IQ. That is the *offset-binary*
+    mapping, and it is not what a HackRF writes -- ``hackrf_transfer`` emits
+    two's-complement samples, and :class:`fpv_rf.sdr.HackrfSource` says so and
+    decodes them as such. So this loader disagreed with the program under test
+    about the format of its own recordings, and the disagreement is invisible in
+    any single output: reading signed data as offset-binary inverts the waveform
+    while preserving its power, so a signal-strength figure stays plausible and
+    only a picture comes out wrong.
+
+    So it goes through the app's own conversion with the hardware format stated
+    explicitly. One implementation of "how are these bytes turned into IQ",
+    which is the only way the offline numbers and the running app can be
+    compared at all.
+    """
     raw = np.fromfile(path, dtype=np.uint8, count=max_samples * 2)
-    raw = raw[: (raw.size // 2) * 2]
-    v = raw.astype(np.float32).reshape(-1, 2)
-    v = (v - 127.5) / 127.5
-    return (v[:, 0] + 1j * v[:, 1]).astype(np.complex64)
+    return sdr.u8_to_iq(raw, sdr.IQEncoding.SIGNED_INT8)
 
 
 def main() -> int:

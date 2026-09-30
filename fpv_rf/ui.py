@@ -95,6 +95,17 @@ class VideoPanel(QWidget):
     blitted cheaply.
     """
 
+    #: Width / height of the picture as it is *displayed*.
+    #:
+    #: This is the shape of analogue video, and it is deliberately not derived
+    #: from the frame. A decoded frame is 240 lines by ``--width`` samples, so at
+    #: the default 160 that is 2:3 and at 320 it is 3:4 -- neither of which is
+    #: 4:3. Scaling the image by its own aspect therefore painted a 2:3 picture,
+    #: made ``--width`` a layout control, and put the geometry of the display
+    #: under the control of a decode-resolution flag. The aspect belongs to the
+    #: signal; the sample count is an implementation detail of the rasteriser.
+    DISPLAY_ASPECT = 4.0 / 3.0
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(320, 240)
@@ -216,11 +227,25 @@ class VideoPanel(QWidget):
             )
             return
 
-        # Letterbox, preserving 4:3.
+        # Letterbox to 4:3, which is the picture's shape and not the shape of
+        # the samples it was decoded into.
+        #
+        # The image is one raster of 240 lines by whatever ``--width`` says, so
+        # it is 2:3 at the default 160 and 3:4 at 320. Fitting *that* aspect
+        # into the widget made the picture a different shape for every width,
+        # and none of them were 4:3 -- so the app was simultaneously distorting
+        # the picture and letting a decode-resolution flag change the layout.
+        # The sample aspect is a sampling artifact; the display aspect is a
+        # property of analogue video, and the widget is fitted to that instead.
         avail = self.rect()
-        scale = min(avail.width() / img.width(), avail.height() / img.height())
-        w = int(img.width() * scale)
-        h = int(img.height() * scale)
+        aspect = self.DISPLAY_ASPECT
+        if avail.width() / max(1.0, avail.height()) > aspect:
+            h = float(avail.height())
+            w = h * aspect
+        else:
+            w = float(avail.width())
+            h = w / aspect
+        scale = min(w / img.width(), h / img.height())
         target = QRectF(
             avail.x() + (avail.width() - w) / 2.0,
             avail.y() + (avail.height() - h) / 2.0,
@@ -308,6 +333,11 @@ class BandChart(QWidget):
         self.setMouseTracking(True)
         self.lo_hz, self.hi_hz = bands.default_scan_span(bands.Region.US)
         self.band_list: list[bands.Band] = list(bands.BANDS_58)
+        #: The region whose legality rules apply to this chart. Kept alongside
+        #: the span because the span is *widened* to cover the band plans, so it
+        #: cannot be used to recover which region was chosen -- and the tooltip
+        #: has to answer with the operator's rules, not the US ones.
+        self.region: bands.Region = bands.Region.US
         self.marks: list[_Mark] = []
         self.tune_hz = 0
         self.selected_hz = 0
@@ -347,6 +377,17 @@ class BandChart(QWidget):
     def set_bands(self, band_list: list[bands.Band]) -> None:
         self.band_list = list(band_list)
         self.set_span(self.lo_hz, self.hi_hz)
+
+    def set_region(self, region: bands.Region) -> None:
+        """Record the region in force, for the tooltip's legality answer.
+
+        Separate from :meth:`set_span` because the two answer different
+        questions. The span is where the axis is drawn, and it is deliberately
+        wider than the region. The region is whose channel list is law, and the
+        tooltip is where that is applied.
+        """
+        self.region = bands.Region(region)
+        self.update()
 
     def set_marks(self, marks: list[_Mark]) -> None:
         self.marks = marks
@@ -498,10 +539,16 @@ class BandChart(QWidget):
         if hit:
             band = self.band_list[hit[0]]
             f = band.channels[hit[1]]
+            # The region the operator actually selected. ``is_legal`` defaults
+            # to US, and that default is wrong for every operator outside it: a
+            # CE, AU or JP user hovering a channel was told "legal here" or
+            # "outside this region" about the US band list while the combo box
+            # above said a different country.
+            legal = bands.is_legal(f, self.region)
             self.setToolTip(
                 f"{band.label} channel {hit[1]+1}\n"
                 f"{bands.format_mhz(f)}  ({f/1e6:.0f} MHz)\n"
-                f"{'legal here' if bands.is_legal(f) else 'outside this region'}"
+                f"{'legal here' if legal else 'outside this region'}"
             )
         else:
             self.setToolTip("")
@@ -601,6 +648,13 @@ class AlertBanner(QFrame):
 # --------------------------------------------------------------------------
 
 
+#: Search threads that were still running when the window gave up waiting for
+#: one. Held at module scope so the wrapper object outlives the run: a QThread
+#: deleted while it is still executing is a crash, and the operator closing the
+#: app is not a reason to hand them one.
+_ORPHANED_SCAN_THREADS: list["ScanThread"] = []
+
+
 class ScanThread(QThread):
     """Runs one band search off the GUI thread.
 
@@ -647,10 +701,27 @@ class ScanThread(QThread):
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
-        if res.error and not res.candidates and res.engine == "sweep":
+        if (res.error and not res.candidates
+                and (res.engine in ("sweep", "none") or res.incomplete)):
             # A sweep that could not run is a failure, not an empty band. Saying
             # "nothing above the noise floor" about a scan that never happened
             # is the one answer that must never come out of this.
+            #
+            # "none" is the engine fastscan._acquisition_failure() stamps on a
+            # result meaning the band was never measured -- the radio did not
+            # come back after the sweep, or it reopened and delivered nothing.
+            # It was missing from this test, so that result fell through to
+            # finished_ok and the UI reported a dead radio as a scan that
+            # completed and found nothing.
+            #
+            # ``incomplete`` covers the hop walk, which this condition used to
+            # miss entirely. A hop whose retune was refused or timed out returns
+            # no samples, and the scanner used to record that as a hop that saw
+            # nothing -- so a radio that gave up on the tenth hop reported a
+            # confident scan of a band it had measured a tenth of, and "nothing
+            # above the noise floor" across the other thirty hops meant nothing
+            # at all. A result that could not measure part of the span is a
+            # failed search, and this is where it becomes one.
             self.failed.emit(res.error)
             return
         self.finished_ok.emit(res)
@@ -689,6 +760,15 @@ class MainWindow(QMainWindow):
         #: can be restored if the search does not end up moving the receiver
         #: somewhere new. Zero means "nothing to restore".
         self._pre_scan_hz = int(source.frequency_hz)
+
+        #: Set once the window starts closing. Suppresses the search-failure
+        #: dialog on the way out, where a modal box blocks the shutdown that
+        #: would have reported it and there is no operator left to read it.
+        self._closing = False
+        #: Prior enabled states of the tuning controls while a search runs.
+        self._tuning_was: dict = {}
+        #: When the close must stop waiting, as a monotonic deadline.
+        self._close_deadline = 0.0
 
         self.setWindowTitle("FPV band search and alert")
         self._build()
@@ -732,6 +812,7 @@ class MainWindow(QMainWindow):
         self.panel = VideoPanel()
         v.addWidget(self.panel, 3)
         self.chart = BandChart()
+        self.chart.set_region(self.args.region)
         self.chart.set_span(*bands.default_scan_span(self.args.region))
         self.chart.channelClicked.connect(self._on_channel_clicked)
         self.chart.bandActivated.connect(self._on_band_activated)
@@ -1017,6 +1098,7 @@ class MainWindow(QMainWindow):
     def _on_region(self, _idx: int) -> None:
         region = self.region.currentData()
         lo, hi = bands.default_scan_span(region)
+        self.chart.set_region(region)
         self.chart.set_span(lo, hi)
         # A new region is a new set of legal channels and a new default sweep,
         # so a band chosen under the old one would silently keep scoping the new
@@ -1138,9 +1220,17 @@ class MainWindow(QMainWindow):
         about a channel the app was not listening to.
         """
         if not self.source.tune(freq_hz):
+            # Say where the receiver actually is, not just that the move failed.
+            # The two frequencies being different is the whole diagnosis, and
+            # leaving it to the operator to work out from the fact that the
+            # channel they asked for is not the one the box is still showing is
+            # a step too many.
+            have = self.source.applied_frequency_hz
+            where = (f"\n\nThe receiver is still on {bands.format_mhz(have)}."
+                     if have else "")
             QMessageBox.warning(
                 self, "Tune failed",
-                f"Could not tune to {bands.format_mhz(freq_hz)}.\n"
+                f"Could not tune to {bands.format_mhz(freq_hz)}.{where}\n"
                 f"{self.source.stats.last_error or 'the source reported no reason.'}",
             )
             return False
@@ -1157,10 +1247,48 @@ class MainWindow(QMainWindow):
         # identical alert for the same drone.
         if clear_alerts:
             self.alerts.clear()
-        self.chart.set_tune(self.source.frequency_hz)
+        # The applied frequency, not the requested one. They are normally the
+        # same, and when they are not the marker is claiming the panel is
+        # watching a frequency the radio is not on -- the same claim the tune
+        # failure above refuses to make.
+        self.chart.set_tune(self.source.applied_frequency_hz)
         if ask_alert:
             self._check_current()
         return True
+
+    #: Every control that changes what the radio is receiving, whether by
+    #: moving it, by reconfiguring it, or by asking for the last result to be
+    #: applied. Disabled for the duration of a search.
+    #:
+    #: A search drives the *same* source, hop by hop. A frequency change, a gain
+    #: change or an auto-select arriving in the middle of one is not a conflict
+    #: the app reports: the tune takes the tuning lock, the search's next hop
+    #: takes it back, and both proceed. The operator gets a scan of a band that
+    #: includes a frequency they chose mid-sweep, with a picture on screen from
+    #: a hop inside the sweep -- and no indication that anything overlapped.
+    #: Reconfiguring the receiver is worse, because a spawn during a sweep is
+    #: the handover race the sweep path goes to such lengths to avoid.
+    TUNING_CONTROLS = ("freq", "lna", "vga", "amp", "auto_btn", "chart")
+
+    def _set_scan_controls(self, running: bool) -> None:
+        """Enable or disable everything that moves the receiver.
+
+        The prior states are remembered, not assumed, because several of these
+        are already disabled for reasons of their own -- a recording cannot be
+        retuned, this build of the transfer helper has no ``-a`` flag -- and
+        blindly re-enabling them when the search ends would hand the operator a
+        control that does nothing, which is a smaller lie than a greyed one but
+        still a lie.
+        """
+        controls = [getattr(self, name) for name in self.TUNING_CONTROLS]
+        if running:
+            self._tuning_was = {w: w.isEnabled() for w in controls}
+            for w in controls:
+                w.setEnabled(False)
+            return
+        for w, was in getattr(self, "_tuning_was", {}).items():
+            w.setEnabled(was)
+        self._tuning_was = {}
 
     def _search_span(self) -> tuple[int, int]:
         """What 'Scan band' sweeps: the active band plan if one is chosen.
@@ -1249,6 +1377,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        # Everything that moves the receiver goes dead for the duration. The
+        # search and the operator were both driving one source, and neither side
+        # knew about the other.
+        self._set_scan_controls(True)
         # Deliberately *not* alerts.clear() here. The whole point of the
         # cooldown and the seen-count is that the second sweep over the same
         # drone says "already known" instead of raising an identical alert; the
@@ -1263,8 +1395,24 @@ class MainWindow(QMainWindow):
         # Say which engine answered, before it answers, when it is knowable.
         # An operator timing a scan needs to know whether 0.2 s means "fast" or
         # "did not run", and the difference is not visible in the result.
-        engine = ("sweep" if fastscan.fast_ok(self.source)
-                  else f"hop-by-hop ({fastscan.why_not_fast(self.source)})")
+        #
+        # The engine question is read from the shared background probe, never
+        # asked here. ``fastscan.fast_ok`` starts the sweep helper with a 20 s
+        # timeout, and asking it on the GUI thread froze the window for up to
+        # twenty seconds at the moment the operator clicked the one button
+        # whose entire job is to be quick. The probe runs on a worker thread
+        # from startup; if it has not answered by the time a scan begins, the
+        # status line says so and the scan thread -- which is a worker thread,
+        # and is the thing that has to know -- waits for the real answer.
+        fastscan.start_probe()
+        if not getattr(self.source, "exclusive_use", False):
+            engine = f"hop-by-hop ({fastscan.why_not_fast(self.source)})"
+        else:
+            probed = fastscan.probe_result()
+            engine = ("sweep" if probed else
+                      f"hop-by-hop ({fastscan.why_not_fast(self.source)})"
+                      if probed is not None else
+                      "sweep or hop-by-hop (still checking the sweep tool)")
         self._status.showMessage(
             f"sweeping {bands.format_mhz(lo_hz)}-{bands.format_mhz(hi_hz)} "
             f"using the {engine} engine"
@@ -1274,22 +1422,56 @@ class MainWindow(QMainWindow):
         self.progress.setValue(int(frac * 1000))
 
     def _on_scan_done(self, res: scan.ScanResult) -> None:
-        self.progress.setValue(1000)
+        self._finalise_scan(res)
+
+    def _on_scan_failed(self, message: str) -> None:
+        self._finalise_scan(None, failure=message)
+
+    def _finalise_scan(self, res: scan.ScanResult | None,
+                       failure: str = "") -> None:
+        """Everything that happens when a search stops, however it stopped.
+
+        One function because the three ways a search ends -- found something,
+        cancelled, or failed outright -- have to leave the app in the same state,
+        and they used to be two functions that did not. ``_on_scan_failed``
+        re-enabled the buttons, showed a dialog and stopped: it never restored
+        the tuning, so a search that failed halfway through the hop walk left
+        the radio on whichever hop it died on, with the frequency box still
+        reading the operator's channel and the picture panel showing a frequency
+        nobody chose. That is the one case where the operator most needs their
+        channel back, and it was the one that lost it. The docstring on
+        :meth:`_restore_pre_scan_tuning` claimed it covered "a search that could
+        not run at all"; nothing called it from there.
+
+        ``res`` is None for a search that produced no result at all. A failure
+        still has to be announced -- silently returning to the previous channel
+        would leave the operator thinking the search simply found nothing.
+        """
         self.scan_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        self._last_result = res
-        events = self.alerts.update(res)
-        self._refresh_marks()
-        self.alert_count.setText(self.alerts.summary())
-        self._status.showMessage(res.describe())
-        if not events:
-            self.banner.set_idle(
-                "nothing above the noise floor"
-                if not res.candidates
-                else f"already known: {self.alerts.active[0].label()}"
-                if self.alerts.active
-                else "idle"
-            )
+        self._set_scan_controls(False)
+        if res is not None:
+            self.progress.setValue(1000)
+            self._last_result = res
+            events = self.alerts.update(res)
+            self._refresh_marks()
+            self.alert_count.setText(self.alerts.summary())
+            self._status.showMessage(res.describe())
+            if not events:
+                self.banner.set_idle(
+                    "nothing above the noise floor"
+                    if not res.candidates
+                    else f"already known: {self.alerts.active[0].label()}"
+                    if self.alerts.active
+                    else "idle"
+                )
+        elif failure:
+            if not self._closing:
+                # Suppressed while closing: a modal dialog on a window that is
+                # on its way out blocks the shutdown it was supposed to report
+                # on, and there is no operator left to read it.
+                QMessageBox.warning(self, "Band search failed", failure)
+            self._status.showMessage(f"band search failed: {failure}")
         # Put the receiver back where the operator left it unless the search
         # moved it to something new.
         #
@@ -1302,7 +1484,7 @@ class MainWindow(QMainWindow):
         # the original channel, so the app claimed to be watching a channel it was
         # not receiving, and said "nothing above the noise floor" while frozen on
         # an arbitrary frequency.
-        if self.autotune.isChecked():
+        if res is not None and self.autotune.isChecked():
             # After the alert bookkeeping, not before: _tune() clears the
             # alert engine, and doing that first would make a brand new finding
             # look like it had never been raised.
@@ -1310,12 +1492,6 @@ class MainWindow(QMainWindow):
                 self._pre_scan_hz = self.source.frequency_hz
                 return
         self._restore_pre_scan_tuning(res)
-
-    def _on_scan_failed(self, message: str) -> None:
-        self.scan_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        QMessageBox.warning(self, "Band search failed", message)
-        self._status.showMessage(f"band search failed: {message}")
 
     def _on_alert(self, ev: alerts.AlertEvent) -> None:
         """Called on the scan thread. Must hand over to the GUI thread.
@@ -1346,18 +1522,33 @@ class MainWindow(QMainWindow):
                 return self.alerts.repeat_count(c)
         return 1
 
-    def _restore_pre_scan_tuning(self, res: scan.ScanResult) -> None:
+    def _restore_pre_scan_tuning(self, res: scan.ScanResult | None) -> None:
         """Return the receiver to the channel the operator was on.
 
         Covers every path where a search finished without choosing a channel:
         auto-select unticked, nothing found, a cancelled search, and a search
         that could not run at all. All four used to leave the radio on the last
-        hop, and only the first two were even reachable before.
+        hop, and only the first two were even reachable before -- this is called
+        from the failure path too, which is the case that most needs it.
 
-        Cancellation and failure go through here too, deliberately. They leave
-        the radio mid-band just as a completed empty scan does, so treating them
-        differently would mean the one case where the operator most wants their
-        channel back is the one that loses it.
+        ``res`` is None when the search failed before producing a result, so the
+        "why" it reports is a failure rather than a cancellation.
+
+        The restore does *not* clear the alert engine, and that is deliberate.
+        This move is not the operator choosing a channel -- it is this window
+        undoing a side effect the search caused, returning the receiver to where
+        it already was. Clearing here threw away what the search had just
+        learned: with auto-select off, the findings were recorded, the engine
+        was emptied on the way back to the original channel, and the next
+        identical sweep raised the same alert again -- inside the cooldown the
+        cooldown was supposed to enforce, because the memory of it had been
+        destroyed a moment earlier. The same reasoning the scan path uses at
+        :meth:`_tune`'s ``clear_alerts`` applies here, in the same direction.
+
+        Nothing is done when the receiver is already where it should be. That is
+        not just an optimisation: the fast sweep engine never moves the radio at
+        all, so this is the path every sweep takes, and clearing the decoder
+        there would blank a perfectly good picture after every search.
         """
         want = self._pre_scan_hz
         if not want or want == self.source.frequency_hz:
@@ -1366,12 +1557,26 @@ class MainWindow(QMainWindow):
             # A file or simulator cannot move, and pretending otherwise would
             # fail. Nothing to restore: it never left.
             return
-        if self._tune(want, ask_alert=False, clear_alerts=True):
-            why = ("search cancelled" if res.stopped_early else
-                   "search could not run" if res.error else "nothing found")
+        if self._tune(want, ask_alert=False, clear_alerts=False):
+            if res is None:
+                why = "search could not run"
+            elif res.stopped_early:
+                why = "search cancelled"
+            elif res.error:
+                why = "search could not run"
+            else:
+                why = "nothing found"
             self._status.showMessage(
                 f"{why} -- back on {bands.format_mhz(want)}"
             )
+        else:
+            # The restore itself failed, so the radio is not on the operator's
+            # channel and the panel is showing whatever the search left it on.
+            # Drop the picture rather than leave a frame from a frequency nobody
+            # is listening to under a status line that says otherwise. _tune has
+            # already told the operator why the move failed.
+            self.source.reset_drain()
+            self.worker.reset()
 
     def _check_current(self) -> None:
         """Assess the channel the operator just chose and alert if it is live.
@@ -1383,8 +1588,17 @@ class MainWindow(QMainWindow):
         channel with nothing on it. An alert that fires on silence trains the
         operator to ignore it, which costs the one property an alert exists to
         have.
+
+        ``snap=False`` because this is an *explicit* choice by the operator. The
+        default snaps a frequency onto the nearest band-plan channel, which is
+        right for a search reporting a peak it located itself and wrong here:
+        type 5802, get measured at 5800 and told so. That is a measurement of a
+        different frequency than the one on the display and in the status line,
+        and a 2 MHz error is enough to be confident and wrong about a channel
+        nobody is on. Verbatim is also what :meth:`BandScanner.assess_frequency`
+        documents for a hand-picked frequency.
         """
-        cand = self.scanner.assess_frequency(self.source.frequency_hz)
+        cand = self.scanner.assess_frequency(self.source.frequency_hz, snap=False)
         if cand is None:
             return
         res = scan.ScanResult(
@@ -1468,46 +1682,131 @@ class MainWindow(QMainWindow):
         # visible rather than absorbed.
         grid = (f"  {st.lines_from_grid}/240 lines from grid"
                 if st.lines_from_grid else "")
+        # Asked for, and actually receiving. These are the same number almost
+        # always, and the exception is the whole reason to print both: a source
+        # that has lent its radio to another process, or whose last retune was
+        # refused, leaves the requested frequency and the applied one apart, and
+        # every other figure on this line -- frame rate, sync, MS/s -- describes
+        # what is arriving, not what was asked for. Without this the status bar
+        # would describe a healthy picture of a channel the radio is not on.
+        want = self.source.frequency_hz
+        have = self.source.applied_frequency_hz
+        asked = (f"  asked {bands.format_mhz(want)}, receiving "
+                 f"{bands.format_mhz(have)}" if want and have and want != have
+                 else "")
         self._status.showMessage(
             f"{st.frames} frames  {st.frame_rate():4.1f} fps  "
             f"decode {st.decode_ms:4.1f} ms  cycle {st.cycle_ms:4.1f} ms  "
             f"{lock}{sync}{grid}  "
             f"source {rate:4.2f} MS/s"
             + (f"  dropped {dropped/1e6:.1f} Ms" if dropped else "")
+            + asked
         )
 
     # -- shutdown ----------------------------------------------------------
 
+    #: How long a closing window waits for a running search to stop, and how
+    #: often it re-checks while waiting.
+    #:
+    #: 10 s because reclaiming the radio after a sweep is a real USB reopen and
+    #: the handover wedge can take a while. A search that has not finished by
+    #: then is not going to, and the window must still close: an app that cannot
+    #: be closed is worse than a search that was abandoned.
+    CLOSE_WAIT_S = 10.0
+    CLOSE_POLL_MS = 200
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        """Cancel the search, wait for it from the event loop, then tear down.
+
+        The wait is a poll, not ``QThread.wait()``. A blocking wait on the GUI
+        thread spins a modal event loop to stay responsive, which means the scan
+        thread's ``finished_ok`` signal is delivered *during* the close -- and
+        the result handler touches the banner, the chart and the status line of
+        a window that is halfway through being dismantled. That was a 3 s wait
+        with the result discarded, so any search still running when the operator
+        closed the window (typically stuck reclaiming a slow radio) had its
+        completion delivered into a dying window.
+
+        With a poll the wait happens in the event loop without re-entering it, so
+        nothing is delivered until the thread has finished, and the teardown
+        runs exactly once, from the GUI thread, at a point where the app is
+        still whole. If the search overruns its budget the thread is detached
+        rather than destroyed: deleting a running QThread underneath itself is a
+        crash, and refusing to close is worse.
+        """
         if self._scan_thread and self._scan_thread.isRunning():
+            self._closing = True
             self._scan_thread.cancel()
-            # Wait for the search to actually finish before tearing down the
-            # radio, and check that it did. The wait used to be 3 s with the
-            # result discarded, so a scan still running -- typically stuck
-            # reclaiming a device that is slow to reopen -- was simply abandoned,
-            # and its completion then ran against a window that was on its way
-            # out. That is the worst time to run code that touches widgets.
-            #
-            # 10 s, because reclaiming the radio after a sweep is a real USB
-            # reopen and the handover wedge can take a while. A scan that has
-            # not finished by then is not going to, and the window must still
-            # close: an app that cannot be closed is worse than a scan that was
-            # abandoned.
-            if not self._scan_thread.wait(10_000):
-                self._status.showMessage("closing: the search did not stop in time")
+            self._close_deadline = time.monotonic() + self.CLOSE_WAIT_S
+            self._status.showMessage("closing: waiting for the search to stop")
+            event.ignore()
+            QTimer.singleShot(self.CLOSE_POLL_MS, self._poll_for_close)
+            return
+        self._teardown()
+        super().closeEvent(event)
+
+    def _poll_for_close(self) -> None:
+        """One step of the close: has the search stopped, or is it out of time?"""
+        th = self._scan_thread
+        if th is not None and th.isRunning():
+            left = self._close_deadline - time.monotonic()
+            if left > 0.0:
+                self._status.showMessage(
+                    f"closing: waiting for the search to stop ({left:.0f} s left)"
+                )
+                QTimer.singleShot(self.CLOSE_POLL_MS, self._poll_for_close)
+                return
+            # Over budget. Detach: the QThread object must outlive the run, and
+            # it must not deliver anything to a window that has gone. The
+            # signals are disconnected for the same reason, and the module-level
+            # list keeps a reference so the wrapper is not collected while the
+            # thread is still inside it.
+            self._status.showMessage("closing: the search did not stop in time")
+            for sig in (th.progress, th.failed, th.finished_ok):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            th.setParent(None)
+            _ORPHANED_SCAN_THREADS.append(th)
+        self._teardown()
+        self.close()
+
+    def _teardown(self) -> None:
+        """Stop the periodic work, then the decoder, then the radio.
+
+        In that order, and once. Called from :meth:`closeEvent` on the way to a
+        clean close and from :meth:`_poll_for_close` when the window is closing
+        while a search runs; every step is idempotent, so being called twice
+        costs nothing.
+        """
         self._paint.stop()
         self._stats.stop()
         self.worker.stop()
         self.source.stop()
-        super().closeEvent(event)
 
 
 def run(source: IQSource, args) -> int:
     """Start the source and run the Qt event loop. Returns the exit code."""
     app = QApplication.instance() or QApplication([])
+    # Ask "can the sweep tool run here" now, in the background, rather than on
+    # the first band search. It starts the helper with a 20 s timeout to find
+    # out, and the operator who clicks "Scan band" should not be the one who
+    # pays for that question. Only for a source that could lend out a radio:
+    # the answer is fixed for the session, and asking it for a simulator would
+    # spawn a helper process to learn nothing.
+    if getattr(source, "exclusive_use", False):
+        fastscan.start_probe()
     source.start()
     win = MainWindow(source, args)
     win.show()
-    if getattr(args, "autoscan", True):
+    # ``--no-autoscan`` is a store_true flag, so argparse spells it
+    # ``no_autoscan`` and there is no ``autoscan`` attribute to read. Reading
+    # one for the other is how the flag became dead: the default of ``True``
+    # always won, so passing it did nothing and the app searched the band on
+    # launch anyway. The nested getattr keeps the test ``Args`` class working --
+    # it declares the positive form, which is what a harness wants to say
+    # "do not scan" in one attribute.
+    if not getattr(args, "no_autoscan", not getattr(args, "autoscan", True)):
         QTimer.singleShot(300, win._on_scan)
     return app.exec()

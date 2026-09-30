@@ -225,19 +225,38 @@ def limit_video_bandwidth(
     The FM discriminator output contains the audio subcarriers (5.8/6.5/7.1 MHz)
     and out-of-band noise well above the video band. Filtering to the video
     band before line sampling markedly improves sync stability.
+
+    No caller passes ``decimate_to`` -- the decode path keeps the full rate,
+    because line sampling needs the sample count to match the line rate. It is
+    here for offline work, and it is fixed rather than left broken: asked to go
+    from 10 MS/s to 5, it used to compute ``ratio = 2``, hand that to
+    ``resample_poly`` as ``up=2, down=1`` and *double* the array, then claim the
+    result was running at 20 MS/s. Two things wrong, in the same line: the
+    factors name the wrong direction, and they are the sample rates rather than
+    the ratio between them. 10 -> 5 is one sample out for every one kept, which
+    is ``resample_poly(x, 1, 2)``.
     """
     x = np.asarray(x, dtype=np.float32)
     nyq = sample_rate_hz / 2.0
     cutoff = float(np.clip(cutoff_hz, 100.0, nyq * 0.95))
 
     if decimate_to and decimate_to < sample_rate_hz:
-        ratio = sample_rate_hz / float(decimate_to)
-        up, down = _rational(ratio)
+        # ``up/down`` is how much the length changes: down > up to shorten.
+        # _rational gives the smallest integers that express the ratio, so the
+        # achieved rate is reported from those factors rather than from
+        # ``decimate_to``, which they only approximate.
+        up, down = _rational(float(sample_rate_hz) / float(decimate_to))
         if _HAVE_SCIPY:
-            x = resample_poly(x, up, down).astype(np.float32)
+            x = resample_poly(x, down, up).astype(np.float32)
+            achieved = sample_rate_hz * down / up
         else:
-            x = _boxcar_decimate(x, down)
-        sample_rate_hz = sample_rate_hz * down / up
+            # No polyphase filter available, so the only decimation that can be
+            # done exactly is by a whole number of samples, and the achieved
+            # rate is that whole-number one rather than the requested one.
+            factor = max(1, int(round(up / down)))
+            x = _boxcar_decimate(x, factor)
+            achieved = sample_rate_hz / factor
+        sample_rate_hz = achieved
         nyq = sample_rate_hz / 2.0
         cutoff = float(np.clip(cutoff_hz, 100.0, nyq * 0.95))
 

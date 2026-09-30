@@ -17,6 +17,20 @@ Three things they take seriously:
 * Ownership and freshness are tested with mocks that *record* ordering, because
   the defects were ordering bugs that produce plausible-looking results.
 
+Cases 16 and 17 are from a later finding rather than that review: the frozen
+build. A capability probe launched a console, which cost 0.66 s, and it ran
+ahead of the first reception, so ``--check``'s fixed half-second sleep read a
+ring nothing had written to yet and reported a working HackRF as one producing
+nothing. Both cases pin the fix and everything around it that a live run would
+not notice if it regressed.
+
+Case 18 is the same finding read a second time, after 17 had already replaced the
+fixed half-second sleep with the bounded wait: the new wait widened a window
+that had been wrongly shaped all along. ``start()`` and the wait sat outside the
+``try`` whose ``finally`` stops the source, so Ctrl-C during the wait leaked the
+receiver -- which is a worse outcome than the bug 17 fixed, because the operator
+is told nothing at all.
+
 Run:  python tools/check_review_fixes.py
 """
 
@@ -27,6 +41,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -821,6 +836,612 @@ def case_scan_restores_tuning() -> bool:
     return good
 
 
+# -- 15: a retune must not starve its own wait ------------------------------
+
+
+class _FakePipe:
+    """A stdout stand-in for a transfer process, with no radio behind it.
+
+    Hands over its payload in ``readinto`` calls, then EOF. A silent pipe --
+    one given a ``silence`` event -- blocks in ``readinto`` on that event, the
+    way a live process with nothing to say does, and only comes back when the
+    event is set.
+
+    It must block rather than give up on a short read timeout, because
+    :meth:`HackrfSource._run` reads *any* zero-length read as EOF: it closes
+    the pipe, kills the process it was reading and clears ``_proc``. A pipe
+    that timed out and answered 0 would therefore have the reader tear down its
+    own fake receiver, and a test written against that arrangement would be
+    measuring a *missing* receiver while claiming to measure a silent one --
+    passing on the EOF path and never reaching the behaviour it is about. The
+    flip side is that whoever sets up a silence owns releasing it: the event
+    has to be set, as the cleanup of the case that installed the pipe does,
+    or the reader stays parked on it.
+    """
+
+    def __init__(self, payload: bytes = b"", *, silence: threading.Event | None = None) -> None:
+        self._payload = payload
+        self._silence = silence
+        self.closed = False
+        self.reads = 0
+
+    def readinto(self, view) -> int:
+        self.reads += 1
+        if self._silence is not None:
+            self._silence.wait()            # alive, and saying nothing
+            return 0                        # ...until told to shut up
+        if self.closed or not self._payload:
+            return 0
+        n = min(len(view), len(self._payload))
+        view[:n] = self._payload[:n]
+        self._payload = self._payload[n:]
+        return n
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeProc:
+    """Just enough ``subprocess.Popen`` for :meth:`HackrfSource._run`."""
+
+    def __init__(self, stdout, stderr=None) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0
+        return 0
+
+
+class _LockHolder:
+    """Stands in for ``retune_settled``, holding ``_tune_lock`` from another thread.
+
+    ``retune_settled`` holds that lock across its wait for samples, and it is
+    the reader that has to produce those samples -- so a reader that queues up
+    behind the lock starves the very wait that is holding it. That is the
+    arrangement reproduced here, with a watchdog release so a regression fails
+    its assertions instead of hanging the gate.
+    """
+
+    def __init__(self, lock, hold_s: float) -> None:
+        self._lock = lock
+        self._hold_s = hold_s
+        self._go = threading.Event()
+        self._held = threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        self._lock.acquire()
+        self._held.set()
+        self._go.wait(self._hold_s)
+        self._lock.release()
+
+    def start(self) -> None:
+        self._thread.start()
+        self._held.wait(1.0)
+
+    def free(self) -> None:
+        self._go.set()
+        self._thread.join(timeout=2.0)
+
+
+def _reader_source() -> "sdr.HackrfSource":
+    """A HackrfSource wired to run the real ``_run``, minus the radio."""
+    src = sdr.HackrfSource(frequency_hz=5_802_000_000, executable="hackrf_transfer")
+    src._stop.clear()
+    return src
+
+
+def _start_reader(src) -> threading.Thread:
+    """Run the real sampling loop against fake pipes."""
+    th = threading.Thread(target=src._run, name="iq-hackrf-test", daemon=True)
+    th.start()
+    return th
+
+
+def _stop_reader(src, th) -> None:
+    src._stop.set()
+    th.join(timeout=2.0)
+
+
+def _wait_ring(src, n_bytes: int, timeout: float) -> float:
+    """Seconds until the ring holds ``n_bytes``, or -1.0 if it never did."""
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+    while time.monotonic() < deadline:
+        if src.ring.total_written >= n_bytes:
+            return time.monotonic() - t0
+        time.sleep(0.002)
+    return -1.0 if src.ring.total_written < n_bytes else time.monotonic() - t0
+
+
+def case_respawn_does_not_starve_retune() -> bool:
+    print("--- 15: the reader's respawn does not starve the retune that caused it ---")
+    good = True
+
+    # 15a: the real defect. _apply_tune() detaches the old process and publishes
+    # None before spawning its replacement, so the reader sees exactly this state
+    # on every retune. It used to block on _tune_lock here -- held by the very
+    # retune now waiting, under that lock, for samples only this thread can
+    # produce.
+    src = _reader_source()
+    spawns = []
+
+    def counted_spawn() -> bool:
+        spawns.append(time.monotonic())
+        return True
+
+    src._spawn_settled = counted_spawn
+    holder = _LockHolder(src._tune_lock, hold_s=4.0)
+    holder.start()
+    th = _start_reader(src)
+    try:
+        time.sleep(0.05)                       # let it reach the lock attempt
+        payload = bytes([100, 120]) * 4096     # 8192 bytes: one complete block
+        src._proc = _FakeProc(_FakePipe(payload))
+        dt = _wait_ring(src, len(payload), timeout=1.0)
+        good &= ok(
+            "a fresh capture completes while the retune still holds the lock",
+            dt >= 0.0,
+            f"{len(payload)} bytes in {dt*1000:.0f} ms" if dt >= 0
+            else f"only {src.ring.total_written} of {len(payload)} bytes",
+        )
+        good &= ok("the wait was not the retune's 2 s timeout",
+                   0.0 <= dt < 1.0, f"{dt:.3f} s")
+        good &= ok("and it happened before the lock came free",
+                   src._tune_lock.locked(), "retune still inside its transaction")
+        good &= ok("no second transfer process was started behind the retune's",
+                   not spawns, f"{len(spawns)} spawn attempt(s)")
+    finally:
+        _stop_reader(src, th)
+        holder.free()
+
+    # The reader exited the loop rather than spinning on the contended lock.
+    good &= ok("stopping ends the reader promptly even under contention",
+               not th.is_alive(), "thread joined inside 2 s")
+
+    # 15b: the replacement is alive but saying nothing. The lock is free, so this
+    # is the plain honest path -- but it must not spawn over the top of a
+    # process that is already there, and the capture must time out rather than
+    # hand back whatever the ring happens to hold.
+    src2 = _reader_source()
+    spawns2 = []
+    src2._spawn_settled = lambda: (spawns2.append(1), True)[1]
+    silence = threading.Event()
+    pipe2 = _FakePipe(silence=silence)
+    proc2 = _FakeProc(pipe2)
+    src2._proc = proc2
+    th2 = _start_reader(src2)
+    try:
+        block = bytes([130, 110]) * 2048      # 4096 bytes from the *old* tuning
+        src2.ring.write(block, 0)
+        iq = src2.retune_settled(5_900_000_000, 16384, timeout=0.5)
+        good &= ok("a replacement that is alive but silent yields an empty capture",
+                   iq.size == 0, f"{iq.size} samples")
+        good &= ok("and the failure is recorded as a discarded measurement",
+                   "discarded" in src2.stats.last_error,
+                   src2.stats.last_error[-52:])
+        good &= ok("the reader did not spawn a second receiver over it",
+                   not spawns2, f"{len(spawns2)} spawn(s)")
+        # The empty capture above is only evidence of silence if there was
+        # something there to be silent. _run treats a zero-length read as EOF:
+        # it closes the pipe, kills the process and clears _proc, so a receiver
+        # that had gone away would produce the same three answers. Asserted
+        # after the capture timeout, while the pipe is still blocked, that the
+        # same fake process is the current one and is still running.
+        good &= ok("the silent receiver is still the process the reader has",
+                   src2._proc is proc2,
+                   "same fake process" if src2._proc is proc2
+                   else f"replaced by {src2._proc!r}")
+        good &= ok("it was never killed for its silence",
+                   proc2.poll() is None and not proc2.terminated,
+                   f"poll={proc2.poll()} terminated={proc2.terminated}")
+        good &= ok("and its pipe is still open, with the read in flight",
+                   not pipe2.closed and pipe2.reads >= 1,
+                   f"closed={pipe2.closed} reads={pipe2.reads}")
+    finally:
+        silence.set()                        # release the blocked reader first
+        _stop_reader(src2, th2)
+
+    # 15c: _released set before the lock could be taken. The check and the spawn
+    # have to stay atomic -- so the reader must wait, take the lock, and then
+    # decline, rather than opening the radio back up in the gap.
+    src3 = _reader_source()
+    spawns3 = []
+    src3._spawn_settled = lambda: (spawns3.append(1), True)[1]
+    holder3 = _LockHolder(src3._tune_lock, hold_s=4.0)
+    holder3.start()
+    th3 = _start_reader(src3)
+    try:
+        time.sleep(0.05)
+        src3._released = True                 # before the lock can be acquired
+        holder3.free()
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and th3.is_alive() and not spawns3:
+            time.sleep(0.01)
+        good &= ok("a released radio is not reopened when the lock frees up",
+                   not spawns3 and src3._proc is None,
+                   f"{len(spawns3)} spawn(s)")
+    finally:
+        _stop_reader(src3, th3)
+        holder3.free()
+
+    # 15d: stop while the lock is held. The contended path must not turn that
+    # into a wait for a lock nobody is going to release.
+    src4 = _reader_source()
+    holder4 = _LockHolder(src4._tune_lock, hold_s=4.0)
+    holder4.start()
+    th4 = _start_reader(src4)
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    _stop_reader(src4, th4)
+    dt_stop = time.monotonic() - t0
+    good &= ok("stop is bounded while the lock stays contended",
+               not th4.is_alive() and dt_stop < 1.0,
+               f"exited in {dt_stop*1000:.0f} ms")
+    holder4.free()
+    return good
+
+
+# -- 16: the capability probe must not open a console ------------------------
+
+
+def case_probe_launches_without_a_console() -> bool:
+    """``hackrf_transfer -h`` runs before the first sample, so its cost *is* startup.
+
+    The probe was a plain ``subprocess.run``. Under console python that is
+    cheap, but the packaged app is a *windowed* exe, and a console-subsystem
+    child launched from one has to bring a console up with it: measured here at
+    0.66 s, against 0.024 s under console python and 0.030 s with
+    ``CREATE_NO_WINDOW``. ``_cmdline`` asks for the flag set while it is
+    building the *receive* command line, so that 0.66 s lands squarely in front
+    of the first reception -- which is how a healthy HackRF came to be reported
+    as a radio that produced nothing.
+
+    Everything else about the probe is pinned here too, because the fix is a
+    single keyword in a call that also carries the arguments, the output
+    capture, the text mode, the timeout and the cache. A probe that quietly
+    stopped caching, or stopped reading stderr, or lost its fail-safe, would be
+    a worse defect than the slow one and no live run would reveal it.
+    """
+    import subprocess
+
+    from fpv_rf import sdr
+
+    HELP = (
+        "usage: hackrf_transfer\n"
+        "  [-r <filename>]        receive IQ to a file\n"
+        "  [-f <frequency>]       frequency\n"
+        "  [-a <amp_enable>]      RF amplifier\n"
+        "  use '-' for stdout\n"
+    )
+    calls: list[dict] = []
+
+    def help_run(args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        return SimpleNamespace(stdout=HELP, stderr="")
+
+    def stderr_run(args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        return SimpleNamespace(stdout="", stderr="  [-i]\n")
+
+    sdr.supported_flags.cache_clear()
+    try:
+        with patch.object(sdr.subprocess, "run", help_run):
+            flags = sdr.supported_flags("fake-hackrf.exe")
+        good = ok("the option set is still parsed out of the help text",
+                  {"r", "f", "a"} <= set(flags),
+                  f"parsed {''.join(sorted(flags))}")
+        good &= ok("the helper is probed exactly once", len(calls) == 1,
+                   f"{len(calls)} call(s)")
+        if calls:
+            kw = calls[0]
+            good &= ok("it still asks the helper for its help",
+                       kw["args"] == ["fake-hackrf.exe", "-h"],
+                       f"args {kw['args']}")
+            good &= ok("and still captures its output as text",
+                       kw.get("capture_output") is True and kw.get("text") is True,
+                       f"capture_output={kw.get('capture_output')} "
+                       f"text={kw.get('text')}")
+            good &= ok("and is still bounded by a timeout",
+                       kw.get("timeout") == 10, f"timeout={kw.get('timeout')}")
+            # The fix itself. Asserted against the real constant rather than a
+            # literal, so this cannot quietly pass on a platform where the
+            # flag does not exist and the fallback is what is being checked.
+            good &= ok("the launch does not bring a console window with it",
+                       kw.get("creationflags")
+                       == getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                       f"creationflags={kw.get('creationflags')!r} vs "
+                       f"CREATE_NO_WINDOW="
+                       f"{getattr(subprocess, 'CREATE_NO_WINDOW', 0)}")
+
+        # Cached per executable: this is paid once per process, and the answer
+        # is what makes a retune cheap.
+        n_before = len(calls)
+        with patch.object(sdr.subprocess, "run", help_run):
+            again = sdr.supported_flags("fake-hackrf.exe")
+        good &= ok("the answer is cached, so a retune pays nothing",
+                   again == flags and len(calls) == n_before,
+                   f"{len(calls) - n_before} extra call(s)")
+
+        # This build prints its options on stderr instead of stdout.
+        sdr.supported_flags.cache_clear()
+        with patch.object(sdr.subprocess, "run", stderr_run):
+            good &= ok("options printed on stderr are read too",
+                       "i" in sdr.supported_flags("stderr-hackrf.exe"))
+
+        # And a probe that cannot answer still means "pass nothing optional"
+        # rather than raising: every flag guarded here is a refinement, and the
+        # direction that loses the radio entirely is passing one.
+        sdr.supported_flags.cache_clear()
+        with patch.object(sdr.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("cmd", 10)):
+            good &= ok("a probe that hangs yields the safe empty set",
+                       sdr.supported_flags("hanging-hackrf.exe") == frozenset(),
+                       "no optional flags passed")
+    finally:
+        sdr.supported_flags.cache_clear()
+    return good
+
+
+# -- 17: --check waits for the radio rather than guessing at its timing ------
+
+
+class _DelayedSource(sdr.IQSource):
+    """A source that takes its time, which is what a real radio opening does.
+
+    ``start()`` returns at once and the thread then does its work, so a check
+    that reads the ring at a fixed moment after ``start`` sees nothing. Three
+    shapes, because the check has to tell them apart:
+
+    * ``write=True`` -- samples arrive, late. A working radio.
+    * ``alive=True, write=False`` -- the transfer process is up and saying
+      nothing. Alive is *not* proof of IQ, and this is the state the old fixed
+      sleep used to mistake for a dead one.
+    * ``error=...`` -- the source gave up at once and said why.
+    """
+
+    kind = "delayed"
+
+    def __init__(
+        self,
+        delay: float = 0.0,
+        *,
+        write: bool = True,
+        n_bytes: int = 2 << 20,
+        alive: bool = True,
+        error: str = "",
+    ) -> None:
+        super().__init__(10_000_000)
+        self.frequency_hz = 5_802_000_000
+        self._applied_hz = self.frequency_hz
+        self.delay = float(delay)
+        self.write = write
+        self.n_bytes = int(n_bytes)
+        self.alive = alive
+        self.error = error
+        self.stopped = 0
+        self._rng = np.random.default_rng(7)
+
+    # start/stop are overridden rather than inherited only to count them: the
+    # claim being tested is that the check stops the source it started, on every
+    # path including the failures. Inheriting the real ones would also acquire
+    # the 1 ms system timer, which is not what these cases are about.
+    def start(self) -> None:
+        self._stop.clear()
+        self.stats.running = self.alive
+        self._thread = threading.Thread(target=self._run, name="iq-delayed",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.stopped += 1
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self.stats.running = False
+
+    def _run(self) -> None:
+        if self.error:
+            self.stats.last_error = self.error
+            self.stats.running = False
+            return
+        if self.delay and self._stop.wait(self.delay):
+            return
+        if not self.write:
+            # Alive and silent, until told to stop.
+            self._stop.wait(5.0)
+            self.stats.running = False
+            return
+        raw = self._rng.integers(0, 256, size=self.n_bytes,
+                                 dtype=np.uint8).tobytes()
+        self.ring.write(raw)
+        self.stats.bytes_total += len(raw)
+
+
+def case_check_waits_for_samples() -> bool:
+    print("--- 17: --check waits for the radio instead of guessing its timing ---")
+    import io
+    from contextlib import redirect_stdout
+
+    import main
+
+    good = ok("the readiness wait is bounded, and generously so",
+              main.CHECK_READY_TIMEOUT_S == 3.0,
+              f"{main.CHECK_READY_TIMEOUT_S:.1f}s (was a flat 0.5 s sleep)")
+    good &= ok("and the minimum verdict is the one it was",
+               main.CHECK_MIN_SAMPLES == 100_000
+               and main.CHECK_SNAPSHOT_SAMPLES == 1_000_000,
+               f"need {main.CHECK_MIN_SAMPLES:,} of "
+               f"{main.CHECK_SNAPSHOT_SAMPLES:,} samples")
+
+    # 17a: the radio is slower than the sleep the check used to take. It does
+    # produce IQ, so the check must pass and must say how many samples it read.
+    src = _DelayedSource(delay=0.7)
+    buf = io.StringIO()
+    t0 = time.monotonic()
+    with patch.object(main, "_alert_box"), redirect_stdout(buf):
+        code = main._check(src)
+    dt = time.monotonic() - t0
+    out = buf.getvalue()
+    good &= ok("a slow radio that does produce IQ passes", code == 0,
+               f"exit {code} after {dt:.2f}s")
+    good &= ok("it waited for the samples rather than reading an empty ring",
+               dt >= 0.7 and src.ring.total_written > 0,
+               f"waited {dt:.2f}s, {src.ring.total_written // 2:,} samples in")
+    good &= ok("and it reported the real count, not a placeholder",
+               "ok: 1000000 samples" in out,
+               next((l for l in out.splitlines() if l.startswith("ok:")), "")[:46])
+    good &= ok("the wait finished inside the deadline",
+               dt < main.CHECK_READY_TIMEOUT_S,
+               f"{dt:.2f}s < {main.CHECK_READY_TIMEOUT_S:.1f}s")
+    good &= ok("and it stopped the source it started", src.stopped == 1)
+
+    # 17b: a transfer process that is alive and silent. Liveness is not IQ, and
+    # this is the state a half-second sleep used to score as a radio producing
+    # nothing. The deadline is shortened here so the gate does not pay 3 s of
+    # wall clock for a case whose point is the verdict, not the patience.
+    silent = _DelayedSource(write=False, alive=True)
+    buf2 = io.StringIO()
+    t0 = time.monotonic()
+    with patch.object(main, "CHECK_READY_TIMEOUT_S", 0.4), \
+         patch.object(main, "_alert_box"), redirect_stdout(buf2):
+        code2 = main._check(silent)
+    dt2 = time.monotonic() - t0
+    out2 = buf2.getvalue()
+    good &= ok("a live process with no samples is not taken as working",
+               code2 == 1, f"exit {code2} after {dt2:.2f}s (transfer was alive)")
+    good &= ok("and it fails within the deadline, not after it",
+               dt2 < 1.5, f"{dt2:.2f}s")
+    good &= ok("the failure reports the startup it waited for",
+               "FAIL:" in out2 and "startup:" in out2 and "radio:" in out2,
+               next((l for l in out2.splitlines() if l.startswith("startup:")),
+                    "")[:52])
+    good &= ok("the silent source was stopped too", silent.stopped == 1)
+
+    # 17c: a source that gave up immediately. Still a nonzero exit, still the
+    # source's own error in the report -- the point of the extra diagnostics is
+    # that they say what the radio said rather than only how few bytes landed.
+    dead = _DelayedSource(alive=False, write=False,
+                          error="HackRF not found (-5)")
+    buf3 = io.StringIO()
+    t0 = time.monotonic()
+    with patch.object(main, "CHECK_READY_TIMEOUT_S", 0.4), \
+         patch.object(main, "_alert_box"), redirect_stdout(buf3):
+        code3 = main._check(dead)
+    dt3 = time.monotonic() - t0
+    out3 = buf3.getvalue()
+    good &= ok("a source that dies at once still fails, within the deadline",
+               code3 == 1 and dt3 < 1.5, f"exit {code3} after {dt3:.2f}s")
+    good &= ok("and the radio's own error is in the report",
+               "HackRF not found (-5)" in out3,
+               next((l for l in out3.splitlines() if l.startswith("last error:")),
+                    "")[:52])
+    good &= ok("and it is stopped on the failure path as well", dead.stopped == 1)
+    return good
+
+
+# -- 18: an interrupted check still stops the source it started -------------
+
+
+def case_interrupted_check_stops_the_source() -> bool:
+    """A Ctrl-C during the readiness wait must not leak the receiver.
+
+    ``start()`` and the bounded wait sat above the ``try`` whose ``finally``
+    stops the source, so an interrupt inside that wait -- up to three seconds of
+    it, on a radio that has not answered yet -- unwound straight past the only
+    ``stop()`` in the function. What leaked was not a handle on paper: the
+    sampling thread, the transfer child holding the USB handle, and the 1 ms
+    system timer held for the whole streaming window. The operator is told
+    nothing either, because the interrupt lands before the first line of the
+    report exists.
+
+    ``_check`` is driven directly, as 17 drives it: it takes a source, prints,
+    raises no dialog of its own that cannot be patched, and returns an int
+    rather than exiting, so no part of it has to be reimplemented here. The
+    seam is the wait, and the fake underneath it is a real shape rather than a
+    stub -- a live-but-silent receiver, the same one 17b uses, which really does
+    sit in the polling loop. The interrupt is raised from inside the sleep that
+    loop spends polling in, which is where a real one lands: on a signal during
+    ``time.sleep``. It raises on the first such sleep, so the case proves the
+    wait was entered as well as proving what happens when it is left.
+    """
+    print("--- 18: a check interrupted while waiting still stops its source ---")
+    import io
+    from contextlib import redirect_stdout
+
+    import main
+
+    src = _DelayedSource(write=False, alive=True)
+    buf = io.StringIO()
+    sleeps: list[float] = []
+
+    def interrupted_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    raised = ""
+    # The deadline is shortened as in 17b so that a regression which somehow
+    # skips the sleep fails its assertions quickly instead of costing the gate
+    # the full three seconds on the way to the same failure.
+    with patch.object(main, "CHECK_READY_TIMEOUT_S", 0.4), \
+         patch.object(main, "_alert_box") as alert, \
+         patch("time.sleep", interrupted_sleep), redirect_stdout(buf):
+        try:
+            main._check(src)
+        except KeyboardInterrupt:
+            raised = "KeyboardInterrupt"
+        except BaseException as exc:           # any other escape is a new path
+            raised = repr(exc)
+
+    out = buf.getvalue()
+    good = ok("the interrupt landed inside the readiness wait, not before it",
+              raised == "KeyboardInterrupt" and bool(sleeps),
+              f"{len(sleeps)} poll sleep(s); _check raised {raised or 'nothing'}")
+    good &= ok("the source the check started was stopped, exactly once",
+               src.stopped == 1, f"stop() ran {src.stopped} time(s)")
+    good &= ok("its sampling thread is gone, not merely told to stop",
+               src._thread is None and not src.running,
+               "thread detached, _stop set")
+    good &= ok("nothing was reported: an interrupted check reaches no verdict",
+               not any(k in out for k in ("ok:", "FAIL:", "startup:", "radio:",
+                                          "last error:")),
+               out.strip()[:46] or "(no output at all)")
+    good &= ok("and no alert box was raised on the way out either",
+               alert.call_count == 0, f"{alert.call_count} alert(s)")
+
+    # The fix is only allowed to work because ``stop`` survives being reached
+    # from more than one place -- which is why there is exactly one ``finally``
+    # rather than a defensive second call. Pinned against the real IQSource,
+    # since the fake above only counts calls and proves nothing about it.
+    real = sdr.SimSource(video=False)
+    real.start()
+    time.sleep(0.05)
+    real.stop()
+    second = ""
+    try:
+        real.stop()
+    except Exception as exc:
+        second = repr(exc)
+    good &= ok("IQSource.stop is safe to call twice, which is what this relies on",
+               second == "" and real._thread is None and not real.running,
+               second or "the second stop() returned cleanly")
+    return good
+
+
 # -- helpers ----------------------------------------------------------------
 
 
@@ -883,6 +1504,10 @@ def main() -> int:
             case_recording_frequency_immutable(),
             case_ui_recording_not_relabelled(),
             case_scan_restores_tuning(),
+            case_respawn_does_not_starve_retune(),
+            case_probe_launches_without_a_console(),
+            case_check_waits_for_samples(),
+            case_interrupted_check_stops_the_source(),
         ]
     bad = [i for i, v in enumerate(cases) if not v]
     print(f"\n{sum(cases)}/{len(cases)} cases passed")

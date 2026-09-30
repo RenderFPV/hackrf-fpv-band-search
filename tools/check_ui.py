@@ -40,11 +40,66 @@ class Args:
     autoscan = False
 
 
+#: Every check this file is going to make, declared up front.
+#:
+#: The results dict used to be filled in by the timer callbacks, so
+#: ``all(results.values())`` at the end asked "is everything that got here
+#: true" rather than "did everything run and come out true". A callback that
+#: raised part-way through left the checks after it missing, the ones before it
+#: still True, and the summary a confident PASS for a run that tested half of
+#: what it claims to test. Predeclaring every name means a stage that never
+#: reports is visibly False instead of absent, which is the whole difference
+#: between a check and a decoration.
+EXPECTED: tuple[str, ...] = (
+    "window built",
+    "picture decodes",
+    "frame rate",
+    "display controls",
+    "scan found the transmitter",
+    "best channel",
+    "banner shows a frequency",
+    "one alert, not many",
+    "chart has a mark",
+    "repeat sweep is quiet",
+    "banner becomes a status line",
+    "auto-select retuned",
+    "chart click retunes",
+    "chart click returns to F4",
+    "controls survive no signal",
+    "auto-select declines on a quiet band",
+)
+
+#: The last stage. A run that stops before this has not finished testing, so
+#: the verdict is a failure even if every check that did run passed -- the same
+#: rule, applied to the run as a whole rather than to one dict entry.
+TERMINAL_STAGE = "after_second_scan"
+
+
 def shot(win: QApplication, name: str, note: str) -> None:
     QApplication.processEvents()
     path = OUT / f"ui_{name}.png"
     win.grab().save(str(path))
     print(f"  wrote {path}  ({note})")
+
+
+def stage(name: str, fn, *args) -> None:
+    """Run one timer callback, turning any exception into a recorded failure.
+
+    Qt swallows an exception raised inside a slot and carries on to the next
+    timer, so a stage that blew up did not stop the run -- it just stopped
+    reporting, which is the case the predeclared results above exist to catch.
+    Here it is also *recorded*, with its traceback, so the failure names itself
+    instead of appearing as three unrelated Falses.
+    """
+    try:
+        fn(*args)
+        print(f"  [stage {name}: done]")
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        errors.append(f"stage {name} raised:\n{traceback.format_exc()}")
+        print(f"  [stage {name}: RAISED]")
 
 
 def check_display(win, results: dict, key: str = "display controls") -> None:
@@ -83,7 +138,15 @@ def check_display(win, results: dict, key: str = "display controls") -> None:
 def main() -> int:
     OUT.mkdir(exist_ok=True)
     app = QApplication.instance() or QApplication([])
-    results: dict[str, bool] = {}
+    # Predeclared, so every name is decided from the start. Anything the run
+    # never reports stays False and is reported as a failure by name, rather
+    # than quietly not existing.
+    results: dict[str, bool] = {k: False for k in EXPECTED}
+    #: Exceptions raised inside a timer callback, recorded rather than swallowed.
+    errors: list[str] = []
+    #: Stages that reached their end. Checked against the terminal stage so a
+    #: run that died part-way cannot be summarised as a pass.
+    stages_done: list[str] = []
 
     # A transmitter on one frequency and an empty band everywhere else, so the
     # scan has something real to find and something real to reject.
@@ -111,6 +174,7 @@ def main() -> int:
         check_display(win, results)
         shot(win, "1_locked", "picture plus band chart, no scan yet")
         win._on_scan()
+        stages_done.append("after_paint")
 
     def after_scan() -> None:
         res = win._last_result
@@ -130,6 +194,7 @@ def main() -> int:
         results["chart has a mark"] = len(win.chart.marks) == 1
         shot(win, "2_alert", "after the scan: banner, chart mark, alert log")
         state["before"] = win.log.count()
+        stages_done.append("after_scan")
 
         # A second sweep over the same signal must not alert again.
         win._on_scan()
@@ -202,22 +267,33 @@ def main() -> int:
         )
         shot(win, "5_empty", "empty band: no channel offered")
         win.close()
+        stages_done.append(TERMINAL_STAGE)
 
     state["before"] = 0
-    QTimer.singleShot(1500, after_paint)
+    QTimer.singleShot(1500, lambda: stage("after_paint", after_paint))
     # A scan shares the source with the decode worker, so it is slower than the
     # standalone scanner benchmark: every hop has to wait for a fresh sim block
     # to land while the decoder is also draining. Allow for that rather than
     # timing a test around it.
-    QTimer.singleShot(7000, after_scan)
-    QTimer.singleShot(13000, after_second_scan)
+    QTimer.singleShot(7000, lambda: stage("after_scan", after_scan))
+    QTimer.singleShot(13000, lambda: stage(TERMINAL_STAGE, after_second_scan))
     QTimer.singleShot(16000, app.quit)
     app.exec()
 
     print()
-    for k, v in results.items():
-        print(f"  {'OK  ' if v else 'FAIL'}  {k}")
-    ok = all(results.values())
+    for k in EXPECTED:
+        print(f"  {'OK  ' if results[k] else 'FAIL'}  {k}")
+    for e in errors:
+        print(f"\n  !! {e}")
+    failed = [k for k in EXPECTED if not results[k]]
+    # Two independent reasons to fail, and both have to be checked. The results
+    # decide whether the things that ran were right; the stage list decides
+    # whether they all ran at all, which a passing subset cannot tell you.
+    missing_stage = TERMINAL_STAGE not in stages_done
+    if missing_stage:
+        print(f"  !! the run never reached its last stage ({TERMINAL_STAGE}); "
+              f"stages completed: {stages_done or ['none']}")
+    ok = not failed and not errors and not missing_stage
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

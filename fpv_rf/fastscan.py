@@ -48,6 +48,80 @@ from . import scan, sdr, sweep
 #: can say why rather than just how slow it was.
 NO_SWEEP = "sweep unavailable"
 
+#: How long a caller off the GUI thread will wait for the shared probe before
+#: giving up and answering "no". Generous enough to cover the probe's own 20 s
+#: subprocess timeout, plus slack for a loaded machine.
+PROBE_WAIT_S = 30.0
+
+#: The session's one sweep-availability answer, and the machinery to obtain it
+#: without anyone having to wait for it.
+#:
+#: ``sweep.available()`` starts the helper with a 20 s timeout to find out
+#: whether it can run at all. That is a once-per-process question, and it used
+#: to be asked on the GUI thread the first time a band search was started -- so
+#: the window froze for up to twenty seconds at exactly the moment the operator
+#: clicked the one button whose whole job is to be quick. The probe is the same
+#: question whoever asks it and the same answer every time, so it is asked once
+#: on a worker thread and read from here by everyone who needs it.
+_probe_lock = threading.Lock()
+_probe_done = threading.Event()
+_probe_result: bool | None = None
+
+
+def _run_probe() -> bool:
+    try:
+        return bool(sweep.available())
+    except Exception:
+        # A probe that raised has not proved the tool is unusable, but it has
+        # certainly not proved it works, and the fallback is a working search.
+        return False
+
+
+def _probe_worker() -> None:
+    global _probe_result
+    try:
+        _probe_result = _run_probe()
+    finally:
+        # Set even on an unexpected failure, so no caller waits forever on a
+        # probe that has already given up.
+        _probe_done.set()
+
+
+def start_probe() -> bool | None:
+    """Begin the sweep-availability probe on a worker thread.
+
+    Idempotent, and never blocks. Returns the answer if it is already known and
+    None if it is still being established -- so a caller can report what it
+    knows and let the answer arrive later rather than wait for it.
+    """
+    global _probe_result
+    if _probe_done.is_set():
+        return _probe_result
+    with _probe_lock:
+        if not _probe_done.is_set():
+            threading.Thread(
+                target=_probe_worker, name="sweep-probe", daemon=True
+            ).start()
+    return _probe_result if _probe_done.is_set() else None
+
+
+def probe_result() -> bool | None:
+    """The session's answer, or None while it is still being established."""
+    return _probe_result if _probe_done.is_set() else None
+
+
+def wait_for_probe(timeout: float = PROBE_WAIT_S) -> bool:
+    """The answer, waiting for it if necessary. For callers off the GUI thread.
+
+    Waiting on the shared probe rather than running a second one matters: two
+    concurrent probes would spawn the helper twice, and the two could disagree
+    about a machine that is slow to start.
+    """
+    if not _probe_done.is_set():
+        start_probe()
+        _probe_done.wait(timeout)
+    return bool(_probe_result)
+
 
 def fast_ok(source: sdr.IQSource) -> bool:
     """Whether the sweep engine can serve this source right now.
@@ -56,14 +130,29 @@ def fast_ok(source: sdr.IQSource) -> bool:
     telling apart. The source has to be a radio that can be lent out, and the
     sweep tool has to exist and start. A simulator satisfies neither, and a file
     source is not retunable at all.
+
+    This blocks on the shared probe, so it belongs on a worker thread. The UI
+    reads :func:`probe_result` instead and reports "still being checked" rather
+    than making the window wait for it.
     """
-    return bool(getattr(source, "exclusive_use", False)) and sweep.available()
+    if not getattr(source, "exclusive_use", False):
+        return False
+    return wait_for_probe()
 
 
 def why_not_fast(source: sdr.IQSource) -> str:
-    """Why the slow engine is in use, in a sentence."""
+    """Why the slow engine is in use, in a sentence.
+
+    Non-blocking. If the shared probe has not answered yet this says so rather
+    than asking the question itself, because the caller here is usually the
+    status line and the answer it wants is "we do not know yet", not a twenty
+    second wait followed by the same sentence.
+    """
     if not getattr(source, "exclusive_use", False):
         return f"{NO_SWEEP}: {source.kind} holds no radio to lend out"
+    if probe_result() is None:
+        start_probe()
+        return f"{NO_SWEEP}: still checking whether the sweep tool runs here"
     # Empty would mean nothing is wrong, which cannot be true on this path --
     # fast_ok() already said no. Kept as a belt-and-braces default so this
     # cannot return an empty reason and leave the status line blank.

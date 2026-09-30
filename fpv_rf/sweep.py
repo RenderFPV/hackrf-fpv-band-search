@@ -797,6 +797,10 @@ def result_from_trace(trace: SweepTrace) -> scan.ScanResult:
         hi_hz=trace.coverage_hi_hz or trace.requested_hi_hz,
         elapsed_s=trace.elapsed_s,
         hops=len(trace.bins),
+        # Every bin of a successful trace was actually read, so the coverage a
+        # result reports has to agree with the bins it was built from -- a result
+        # claiming zero measured units would be read as no search having run.
+        measured=len(trace.bins) if trace.ok else 0,
         noise_floor_db=trace.floor_db(),
         error=trace.error,
     )
@@ -845,14 +849,21 @@ def result_from_trace(trace: SweepTrace) -> scan.ScanResult:
             peak_offset_hz=peak.freq_hz - centre,
             floor_db=floor,
         )
-        match = bands.match_frequency(centre)
+        # The same rule the hop scan uses, and for the same reason: a run of
+        # bins measures a transmitter to within its own width, so a chart
+        # channel further away than half that width is not one this measurement
+        # found. Before, off_chart was ``match is None``, which the nearest-match
+        # call never returns for an in-band frequency -- so a fast sweep labelled
+        # everything on-chart while the same finding from a hop scan was
+        # reported off-chart, and the two labels were both on screen at once.
+        match, off_chart = scan.match_within(centre, int(span_hz))
         cand = scan.Candidate(
             frequency_hz=centre,
             reading=_reading(excess, span_hz >= NARROW_HZ),
             match=match,
             uncertainty_hz=int(span_hz),
             coarse=hit,
-            off_chart=match is None,
+            off_chart=off_chart,
             span_hz=span_hz,
             merged=len(run),
         )

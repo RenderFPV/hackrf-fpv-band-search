@@ -82,6 +82,12 @@ class DecodeStats:
     #: field that needed 40 of 240 positions reconstructed is a weaker claim than
     #: one that needed none, and a viewer is entitled to know which they have.
     lines_from_grid: int = 0
+    #: Times a block of IQ was discarded because it straddled a retune. Each one
+    #: is a field of real video thrown away on purpose -- the samples either side
+    #: of a retune are from two different transmitters and the discriminator
+    #: cannot treat them as one stream -- so the cost of staying correct is worth
+    #: showing rather than hiding.
+    tune_seams: int = 0
 
     def frame_rate(self) -> float:
         el = max(1e-6, time.monotonic() - self.started_at)
@@ -103,6 +109,11 @@ class VideoFrame:
     standard: str
     locked: bool
     lines_from_grid: int = 0
+    #: Which decoder epoch produced this frame. Bumped by
+    #: :meth:`DecodeWorker.reset`, so a consumer can tell a frame that survived a
+    #: retune from one produced afterwards; appended last so that positional
+    #: construction of a frame is unchanged for anything building one directly.
+    generation: int = 0
 
     @property
     def width(self) -> int:
@@ -194,6 +205,15 @@ class DecodeWorker:
         #: any reset from the GUI thread mutate. Separate from ``_lock``, which
         #: only guards the published frame.
         self._decoder_lock = threading.Lock()
+        #: Bumped on every reset. The decode loop checks it inside
+        #: ``_decoder_lock`` before feeding samples in and again before
+        #: publishing, so a reset that lands mid-iteration cannot have its work
+        #: published afterwards. Without the first check the freshly reset
+        #: decoder was fed a block captured before the retune -- the exact
+        #: two-transmitter picture :meth:`reset` exists to prevent -- and without
+        #: the second, a frame built from the old frequency was published after
+        #: ``_frame`` had been cleared, leaving the old picture on screen again.
+        self._generation = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_decode = 0.0
@@ -267,11 +287,17 @@ class DecodeWorker:
 
         The decoder is reset *through* :meth:`_reset_decoder`, which serialises on
         the same lock the decode loop takes around ``push_iq``. Resetting from the
-        GUI thread while the decode thread is inside the decoder was a data race
+        GUI thread while the decode thread was inside the decoder was a data race
         on the demodulator's internal state -- the frame lock only ever guarded
         the published frame, never the decoder, so it was not protecting the
         thing that needed protecting.
+
+        The generation is bumped under ``_lock`` *before* the decoder is touched,
+        so a decode already in flight sees a mismatch and throws its result away
+        rather than publishing a frame built from the frequency we just left.
         """
+        with self._lock:
+            self._generation += 1
         self._reset_decoder()
         with self._lock:
             self._frame = None
@@ -313,6 +339,11 @@ class DecodeWorker:
         t0 = time.perf_counter()
         deadline = t0
         while not self._stop.is_set():
+            # Snapshot of the epoch this iteration belongs to. Read once, here,
+            # so every check below compares against the same value: a reset in
+            # the middle of an iteration invalidates the whole of it.
+            with self._lock:
+                generation = self._generation
             iq = self.source.drain_iq(self._max_chunk)
             self.stats.chunk_samples = iq.size
             t_dec = time.perf_counter()
@@ -328,9 +359,30 @@ class DecodeWorker:
                 self._stop.wait(0.004)
                 t0 = time.perf_counter()
                 continue
+            if self._spans_retune():
+                # The block holds the tail of one frequency and the head of
+                # another, because a retune landed inside the drain window. The
+                # demodulator would read the junction as a phase step and
+                # invent a sync pulse at it -- a frame assembled from two
+                # transmitters, which is the one artefact an FM receiver cannot
+                # produce on its own and so is never mistaken for a fault.
+                # The samples are dropped and the decoder is reset, so the next
+                # block starts a clean stream; the picture goes blank for a
+                # field or two, which is what a retune looks like anyway.
+                self.stats.tune_seams += 1
+                self._reset_decoder()
+                self._stop.wait(0.004)
+                t0 = time.perf_counter()
+                continue
             try:
                 with self._decoder_lock:
-                    frame = self.decoder.push_iq(iq)
+                    if self._generation != generation:
+                        # A reset landed between the drain and the decoder lock.
+                        # These samples predate it, so feeding them in would
+                        # rebuild exactly the picture the reset exists to clear.
+                        frame = None
+                    else:
+                        frame = self.decoder.push_iq(iq)
             except Exception as exc:  # keep the pipeline alive on a bad chunk
                 # Swallowed silently before, which turned a repeating programming
                 # error into indistinguishable "loss of video": the frame counter
@@ -350,8 +402,19 @@ class DecodeWorker:
 
             if frame is not None:
                 with self._lock:
-                    self._frame = frame
-                    self._published_at = time.monotonic()
+                    if self._generation == generation:
+                        # Published only if no reset has happened while this
+                        # field was being decoded. Publishing an epoch-stale
+                        # frame would put the old frequency's picture back on
+                        # screen after the panel had been cleared for it.
+                        self._frame = frame
+                        self._published_at = time.monotonic()
+                    else:
+                        frame = None
+                if frame is None:
+                    self._stop.wait(0.004)
+                    t0 = time.perf_counter()
+                    continue
                 self.stats.frames += 1
                 self.stats.locked_frames += 1
                 self.stats.last_frame_at = time.monotonic()
@@ -386,6 +449,22 @@ class DecodeWorker:
             now = time.perf_counter()
             self.stats.cycle_ms = self.stats.cycle_ms * 0.9 + (now - t0) * 1000.0 * 0.1
             t0 = now
+
+    def _spans_retune(self) -> bool:
+        """Whether the last drained block contains more than one tuning.
+
+        The source records the tuning id of the first and last sample of every
+        hand-over, taken at the same instant as the data under the same lock. A
+        difference means a retune landed inside the window, so the block is a
+        mixture and cannot be demodulated as one stream -- the discriminator
+        would read the junction as a phase step and manufacture a sync pulse
+        there. Nothing in the samples themselves says so: two frequencies look
+        like two frequencies, and the artefact appears as a perfectly ordinary
+        frame that is in fact assembled from two transmitters.
+        """
+        ids = getattr(self.source, "last_drain_tune_ids", (0, 0))
+        first, last = ids
+        return bool(first or last) and first != last
 
     def _count_missed_fields(self) -> None:
         """Account for a stretch during which no field could be locked.

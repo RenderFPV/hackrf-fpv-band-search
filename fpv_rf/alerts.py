@@ -392,11 +392,16 @@ class AlertEngine:
 class Beeper:
     """Optional audible alert, on a short-delay tone.
 
-    Two things this deliberately does not do. It does not beep synchronously:
-    ``winsound.Beep`` blocks for its whole duration, and doing that on the
-    scanner's thread would stall the next hop. And it does not queue: if three
-    findings appear in one sweep, that is one pattern, not three overlapping
-    tones, because three simultaneous beeps are just noise.
+    Three things this deliberately does not do. It does not block:
+    ``winsound.Beep`` blocks for its whole duration, and the caller is the Qt
+    event loop -- a 180 ms tone there is 180 ms of the picture not repainting,
+    on a repaint that is supposed to happen every 16 ms. The tone is played on a
+    worker thread that outlives the call. It does not queue: if three findings
+    appear in one sweep, that is one pattern, not three overlapping tones,
+    because three simultaneous beeps are just noise -- so an in-flight tone
+    coalesces the next one into itself. And it does not accumulate threads:
+    the thread is started per accepted beep and joined by the next one, so a
+    quiet hour costs nothing.
 
     Falls back to printing to stderr where there is no console beep, so a
     headless run still says something.
@@ -414,6 +419,10 @@ class Beeper:
         self._last = 0.0
         self._lock = threading.Lock()
         self.suppressed = 0
+        #: The thread currently sounding a tone, if any. Held so a second beep
+        #: can tell that one is in flight, which is what coalescing means, and
+        #: what keeps overlapping tones from stacking up.
+        self._playing: threading.Thread | None = None
 
     @property
     def available(self) -> bool:
@@ -424,26 +433,56 @@ class Beeper:
             return self.LOST_TONE
         return self.FOUND_TONE
 
-    def beep(self, kind: AlertKind = AlertKind.FOUND) -> bool:
-        """Sound once. Returns whether a tone was actually produced."""
-        if not self.enabled:
-            return False
-        with self._lock:
-            now = time.monotonic()
-            if now - self._last < self.minimum_gap_s:
-                self.suppressed += 1
-                return False
-            self._last = now
-        freq, ms = self._tone(kind)
+    def _play(self, kind: AlertKind, freq: int, ms: int) -> None:
+        """Sound one tone; say so on stderr where there is no console beep.
+
+        Runs on the worker thread :meth:`beep` starts. Every failure path ends
+        in the stderr line, because a beep the platform refused must not be
+        silently dropped, and ``winsound.Beep`` failing is exactly what happens
+        on a session with no audio device.
+        """
         if self.available:
             try:
                 import winsound
 
-                winsound.Beep(freq, ms)   # a short tone cannot outlast a hop
-                return True
+                winsound.Beep(freq, ms)
+                return
             except Exception:
                 pass
         print(f"\a[{freq} Hz {ms} ms] {kind.value}", file=sys.stderr)
+
+    def beep(self, kind: AlertKind = AlertKind.FOUND) -> bool:
+        """Sound once. Returns whether a tone was actually produced.
+
+        Returns as soon as the tone is *accepted*; it does not wait for it to
+        finish. Callers are on the Qt event loop, and a method that reads like
+        "make a noise now" quietly costing 180 ms of repaints is how a panel
+        ends up juddering exactly when something interesting happens.
+        """
+        if not self.enabled:
+            return False
+        freq, ms = self._tone(kind)
+        with self._lock:
+            now = time.monotonic()
+            busy = self._playing is not None and self._playing.is_alive()
+            if now - self._last < self.minimum_gap_s or busy:
+                # Two ways to say the same thing: too soon, or a tone still
+                # sounding. The first is a minimum gap between alerts, the
+                # second is the one pattern instead of several overlapping
+                # tones. Both mean "already said something", so both are
+                # counted here and neither queues work.
+                self.suppressed += 1
+                return False
+            self._last = now
+            th = threading.Thread(
+                target=self._play, args=(kind, freq, ms),
+                name="alert-beep", daemon=True,
+            )
+            self._playing = th
+            # Started under the same lock as the assignment: between the two,
+            # a second caller saw a thread that was set but not yet alive, so
+            # is_alive() said False and it started an overlapping tone.
+            th.start()
         return True
 
     def pattern(self, events: list[AlertEvent]) -> int:

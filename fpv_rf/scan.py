@@ -201,6 +201,17 @@ class ScanResult:
     #: "something was here and it turned out to be nothing" is not a finding.
     false_positives: int = 0
     hops: int = 0
+    #: Measurement units that actually returned usable data. ``hops`` is what was
+    #: *attempted*, so on a result that lost part of the band the two differ and
+    #: the difference is the honest measure of coverage. Before this existed, a
+    #: hop whose retune timed out was recorded as a hop that saw nothing, so a
+    #: radio that gave up halfway produced a result indistinguishable from a
+    #: quiet band -- and quiet is the answer an operator acts on.
+    measured: int = 0
+    #: Units where no reading could be taken at all: the retune was refused, or
+    #: no fresh samples arrived before the timeout. Never a count of empty
+    #: channels -- those are quiet, and quiet is a measurement.
+    failed_hops: int = 0
     gate_bins: int = COARSE_BIN_COUNT
     gate_peak_db: float = COARSE_PEAK_GATE_DB
     elapsed_s: float = 0.0
@@ -219,6 +230,18 @@ class ScanResult:
     @property
     def occupied(self) -> list[Candidate]:
         return [c for c in self.candidates if c.reading.occupied]
+
+    @property
+    def incomplete(self) -> bool:
+        """True when part of the span was not measured at all.
+
+        Distinct from ``error`` in the sense that it does not mean the search
+        failed outright: results with candidates can be incomplete too. What it
+        means is that the silence in this result is partly silence *about the
+        receiver*, and an absent channel cannot be called absent when the hop
+        that would have looked at it never produced a reading.
+        """
+        return self.failed_hops > 0
 
     @property
     def decodable(self) -> list[Candidate]:
@@ -263,13 +286,26 @@ class ScanResult:
             # slow for a reason other than retuning should look different here.
             if self.hops > 1:
                 head += f", {self.elapsed_s / self.hops * 1000.0:.0f} ms/hop"
-        if self.error:
-            return f"{head}: {self.error}"
         tail = (
             f" ({self.false_positives} hop(s) cleared the gate but held noise)"
             if self.false_positives else ""
         )
+        if self.incomplete:
+            # Say which part of the band is unaccounted for. A hop that could not
+            # be measured leaves exactly as much silence as an empty one, and the
+            # operator reading "nothing found" has to know which of the two it is.
+            tail += (
+                f" ({self.failed_hops} of {self.hops} {self._unit}(s) "
+                f"could not be measured)"
+            )
+        if self.error:
+            # Folded into the head rather than replacing the rest, so a search
+            # that found something *and* then lost part of the band still reports
+            # what it found. The old form returned here and dropped the findings.
+            head = f"{head}: {self.error}"
         if not self.candidates:
+            if self.error:
+                return f"{head}{tail}"
             return (
                 f"{head}: nothing above the noise floor{tail} "
                 f"(loudest quiet {self._unit} peaked "
@@ -283,6 +319,36 @@ class ScanResult:
     @property
     def _unit(self) -> str:
         return "bin" if self.engine == "sweep" else "hop"
+
+
+def match_within(
+    centre_hz: int, uncertainty_hz: int
+) -> tuple[bands.Match | None, bool]:
+    """The chart channel this measurement can name, and whether it can name one.
+
+    Returns ``(match, off_chart)``. ``match`` is the nearest channel across every
+    plan, which may well belong to a different one -- naming is a display
+    convenience and is not scoped to a band. ``off_chart`` says whether that
+    channel falls inside the window the measurement can actually resolve.
+
+    The two are separate answers to separate questions, and conflating them is
+    how a coarse finding ends up labelled with a channel number that is provably
+    not where the signal is. A 9 MHz hop resolves the transmitter to +-4.5 MHz,
+    so a chart channel 6 MHz away is not a channel this measurement found; it is
+    the nearest one, and saying so is the difference between a label an operator
+    can trust and one they cannot.
+
+    Module level, and shared, because the callers disagreed: the hop scan
+    applied the window and the sweep applied none at all, so ``off_chart`` from
+    the fast path was effectively always False and the same finding could be
+    on-chart by one route and off-chart by the other.
+    """
+    centre = int(centre_hz)
+    half = int(uncertainty_hz) // 2
+    m = bands.match_frequency(centre)
+    if m is not None and abs(centre - m.frequency_hz) <= half:
+        return m, False
+    return m, True
 
 
 class BandScanner:
@@ -396,12 +462,10 @@ class BandScanner:
         is reported as off-chart rather than being forced onto a channel number
         that is not where the signal is.
         """
-        centre = hit.hop_hz
-        half = self.hop_hz // 2
-        m = bands.match_frequency(centre)
-        if m is not None and abs(centre - m.frequency_hz) <= half:
+        m, off_chart = match_within(hit.hop_hz, self.hop_hz)
+        if not off_chart and m is not None:
             return m.frequency_hz, self.hop_hz, False, m
-        return centre, self.hop_hz, True, m
+        return hit.hop_hz, self.hop_hz, True, m
 
     def scan(
         self,
@@ -431,9 +495,19 @@ class BandScanner:
                 cand = self.assess_frequency(self.source.frequency_hz, snap=False)
                 if cand is not None:
                     res.candidates.append(cand)
+                    res.measured += 1
                     res.noise_floor_db = cand.reading.noise_db
                     res.hits.append(CoarseHit(cand.frequency_hz, 0,
                                               cand.reading.peak_to_median_db, 0.0))
+                else:
+                    # Nothing came back. That is "could not read the recording",
+                    # not "the recording is empty", and it is reported as such so
+                    # the result cannot be read as a clean bill of health.
+                    res.failed_hops += 1
+                    res.error += (
+                        "; the recording produced too few samples to assess, so "
+                        "what it holds is unknown rather than absent"
+                    )
             else:
                 res.error += "; recording has no recorded frequency, so it has " \
                               "no band to name"
@@ -450,7 +524,19 @@ class BandScanner:
             iq = self.source.retune_settled(
                 centre, self.coarse_samples, self.settle_timeout
             )
-            res.hits.append(self._coarse_hit(centre, iq))
+            if iq.size < COARSE_NFFT * 2:
+                # No reading. Recording it as a hop that saw nothing would make
+                # a dead or loaned radio indistinguishable from an empty band,
+                # and the two demand opposite responses from the operator. So
+                # the hop is counted as failed and *not* appended: an unmeasured
+                # hop has no spectrum, and putting a fabricated one in ``hits``
+                # would also corrupt the noise floor, the peak-over-floor
+                # headline and the false-positive count that follow from it.
+                res.failed_hops += 1
+                self._note_failure(res, centre)
+            else:
+                res.measured += 1
+                res.hits.append(self._coarse_hit(centre, iq))
             if progress is not None:
                 progress(f"coarse {i + 1}/{total}", (i + 1) / total)
 
@@ -469,7 +555,18 @@ class BandScanner:
                 freq, self.thorough_samples, self.settle_timeout
             )
             if iq.size < 4096:
+                # The coarse pass saw energy here and the thorough pass could
+                # not look. Not a false positive -- a false positive is a hop
+                # that held noise, and this is a hop that was never read.
+                res.failed_hops += 1
+                self._note_failure(res, freq)
+                if progress is not None:
+                    progress(
+                        f"verify {i + 1}/{len(targets)} {bands.format_mhz(freq)}",
+                        (i + 1) / len(targets),
+                    )
                 continue
+            res.measured += 1
             cand = Candidate(
                 frequency_hz=freq,
                 reading=dsp.assess_channel(iq, self.source.sample_rate),
@@ -497,6 +594,29 @@ class BandScanner:
         res.candidates = self._merge(verified, VTX_WIDTH_HZ)
         res.candidates.sort(key=lambda c: -c.strength)
         return res
+
+    @staticmethod
+    def _note_failure(res: ScanResult, frequency_hz: int) -> None:
+        """Say, once, that a unit of the search could not be measured.
+
+        ``error`` and not ``stopped_early``, and that distinction is the whole
+        point. ``stopped_early`` means the operator pressed stop: the part of the
+        band that was skipped is skipped on purpose. A failure means the receiver
+        did not answer, and the part of the band it was covering is unknown --
+        which the UI reports differently, so conflating them either buried a
+        fault or cried wolf on a cancellation.
+
+        Only the first is kept; ``failed_hops`` carries the count. A radio that
+        is gone fails all 34 hops the same way, and 34 copies of one sentence
+        would bury the line that matters.
+        """
+        if res.error:
+            return
+        res.error = (
+            f"could not measure {bands.format_mhz(frequency_hz)} -- the tuner "
+            f"returned no fresh samples, so that part of the span is unknown "
+            f"rather than empty"
+        )
 
     @staticmethod
     def _merge(
@@ -621,6 +741,18 @@ class BandScanner:
         that one label to the active band rejected genuine, verified findings
         from the band the operator had actually chosen. So the test is
         "is this frequency one of that band's channels".
+
+        The tolerance is the finding's own resolution, not a fixed constant. A
+        coarse hop knows its transmitter to within half a hop, and matching that
+        to the nearest channel to the hertz is a claim the measurement never
+        made: a 5880 MHz finding measured on a 9 MHz grid is within 4.5 MHz of
+        that channel, which says nothing about whether the transmitter is on E8
+        at 5885. Scoping used to run at 250 kHz, so on any wide search *no*
+        finding could ever be a member of the band it was found on, and clicking
+        a row on the chart to search that band produced "nothing to listen to"
+        with the answer on the chart right above it. The wider of the two wins,
+        so a hand-picked frequency (zero uncertainty) is still matched tightly
+        and a hop measurement is matched to the precision it actually has.
         """
         pool = result.occupied
         if band is None:
@@ -633,6 +765,7 @@ class BandScanner:
             for cand in pool:
                 if want_decodable and not cand.decodable:
                     continue
-                if bands.band_contains(cand.frequency_hz, band):
+                tol = max(bands.EXACT_TOL_HZ, cand.half_width_hz)
+                if bands.band_contains(cand.frequency_hz, band, tol):
                     return cand
         return None
