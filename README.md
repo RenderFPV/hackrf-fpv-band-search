@@ -60,6 +60,13 @@ needed. The name has no spaces in it on purpose: the first build shipped to
 file has to be quoted everywhere and is awkward to type into a Run box. The
 build output should be the one thing in this project that is hard to misplace.
 
+If you would rather not dig into `dist\`, double-click **`FPV-RF.cmd`** in the
+project root. It starts the app where it is and forwards any arguments, so
+`FPV-RF.cmd --check` works too. The exe cannot simply be moved up there — it
+needs its own folder beside it, for the reason below — and copying 212 MB to
+make the shortcut real would only leave the same app in two places.
+`build_exe.py` writes that file on every build, so it cannot go stale.
+
 `hackrf_transfer.exe` is copied in beside it, and the app looks for it there
 *before* `PATH`, so the copy shipped with the app is the one that runs rather
 than some other version found elsewhere on the machine.
@@ -525,6 +532,7 @@ picture that is actually a different picture every frame.
 ```
 main.py                 argument parsing, source selection, --check, logging
 build_exe.py            package the app as a double-clickable .exe
+FPV-RF.cmd              start that build from the project root
 tools/make_release.py   zip the build, checksum it, attach it to a release
 fpv_rf/dsp.py           demod, de-emphasis, sync, rasteriser, classification
 fpv_rf/bands.py         the band plans, frequency -> band/channel, legality
