@@ -40,6 +40,16 @@ from pathlib import Path
 import numpy as np
 import re
 
+# TEMP DIAG: counters for the decode-failure investigation. Off unless
+# FPV_RF_DIAG is set; delete this import and every TEMP DIAG block below
+# together with fpv_rf/diag.py. The fallback keeps this file runnable on its own
+# (``python fpv_rf\sdr.py``), which the relative import would otherwise break.
+try:
+    from . import diag
+except ImportError:  # pragma: no cover - direct script execution
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from fpv_rf import diag
+
 # 10 MS/s sustains a native NTSC/PAL field rate: 60 fields/s needs
 # 10.014 MS/s and 50 fields/s needs 9.98 MS/s, so this is the one rate that
 # serves both standards without resampling. 20 MS/s is not an option because
@@ -71,8 +81,9 @@ OPEN_RETRY_MIN = 0.015
 OPEN_RETRY_MAX = 0.35
 OPEN_RETRY_GROWTH = 1.6
 
-#: Where ``hackrf_transfer`` is looked for last, after ``$HACKRF_TRANSFER`` and
-#: the copy beside this program. These are globs rather than fixed paths because
+#: Where ``hackrf_transfer`` is looked for last, after ``$HACKRF_TRANSFER``, the
+#: copy beside this program and the one in ``tools/``. These are globs rather
+#: than fixed paths because
 #: the official Windows builds and the Mayhem firmware releases both unpack into a
 #: version-stamped folder whose name nobody can predict -- and a hardcoded
 #: ``C:\Users\<you>\Desktop\...`` in a public repository is nobody's path but
@@ -156,10 +167,12 @@ def supported_flags(executable: str) -> frozenset[str]:
 
 
 def find_hackrf_transfer() -> str | None:
-    """Locate ``hackrf_transfer``: env override, beside the app, PATH, then known installs.
+    """Locate ``hackrf_transfer``: env override, beside the app, ``tools/``, PATH,
+    then known installs.
 
-    A copy sitting next to the executable is preferred over ``PATH`` on purpose.
-    A self-contained build that silently picked up a *different* version of the
+    A copy sitting next to the executable -- or in this checkout's ``tools/``
+    folder, for an unfrozen run -- is preferred over ``PATH`` on purpose. A
+    self-contained build that silently picked up a *different* version of the
     radio helper from somewhere else on the machine would be a miserable bug to
     chase, and the whole point of shipping one beside the exe is that it is the
     one being used.
@@ -171,6 +184,17 @@ def find_hackrf_transfer() -> str | None:
         beside = app_dir() / name
         if beside.exists():
             return str(beside)
+    # ``tools/`` is where this repository keeps the helper, and ``_TRANSFER_GLOBS``
+    # did not cover it: those patterns are anchored at ``Path.home()``, so its
+    # "tools/hackrf_transfer.exe" entry only ever matched ``~/tools/``, never the
+    # checkout this module ships in. Unfrozen, that left the copy sitting in the
+    # tree invisible and resolution fell through to whatever was on the Desktop
+    # -- the opposite of the preference stated above. Frozen, this is simply a
+    # miss, which is right: beside-the-exe has already had its turn by then.
+    for name in ("hackrf_transfer.exe", "hackrf_transfer"):
+        in_tools = app_dir() / "tools" / name
+        if in_tools.exists():
+            return str(in_tools)
     found = shutil.which("hackrf_transfer") or shutil.which("hackrf_transfer.exe")
     if found:
         return found
@@ -233,6 +257,86 @@ class TimerResolution:
         self.release()
 
 
+@dataclass(frozen=True)
+class RingSnapshot:
+    """One contiguous run of ring bytes, with the absolute range it covers.
+
+    ``first_byte``/``last_byte`` are absolute write-counter positions, so they
+    name the same stretch of stream wherever they are read; ``first_tune_id``
+    and ``last_tune_id`` say which tuning was in effect at each end, and the
+    ``*_stream_id`` pair says which producing process wrote each end. Those
+    differing is the only way a snapshot can be non-contiguous in *meaning*
+    rather than in bytes, and it has to travel with the data: samples from two
+    frequencies look like two frequencies, not like a splice -- and neither do
+    samples either side of a transfer-process restart.
+
+    The stream ids default to 0 so a caller constructing one positionally keeps
+    working; every path that goes through :class:`IQRing` fills them in.
+    """
+
+    data: bytes
+    first_byte: int
+    last_byte: int
+    first_tune_id: int
+    last_tune_id: int
+    first_stream_id: int = 0
+    last_stream_id: int = 0
+
+    @property
+    def samples(self) -> int:
+        return len(self.data) // 2
+
+    @property
+    def spans_tune(self) -> bool:
+        """True when the snapshot holds the tail of one tuning and the head of the next."""
+        return self.first_tune_id != self.last_tune_id
+
+    @property
+    def spans_stream(self) -> bool:
+        """True when the snapshot holds the tail of one process and the head of the next."""
+        return self.first_stream_id != self.last_stream_id
+
+
+@dataclass(frozen=True)
+class RingRead:
+    """One hand-over out of the ring, with everything a consumer needs.
+
+    All of it comes out of *one* acquisition of the ring's lock. That is the
+    whole reason this is a record rather than four return values: reading the
+    write counter and then the bytes lets a write landing in between be counted
+    as consumed and never handed over, which cannot be made correct, only less
+    likely.
+
+    Ranges are half-open and absolute -- ``[first_byte, last_byte)`` of the
+    ring's monotonic write counter -- and byte positions are always even, so
+    ``// 2`` gives the absolute *sample* index of the same span with no
+    rounding. ``cursor`` is the new read position: the write counter as observed
+    under that same lock, so everything up to it has either been delivered in
+    ``data`` or deliberately skipped.
+    """
+
+    data: bytes | bytearray
+    cursor: int
+    first_byte: int
+    last_byte: int
+    first_tune_id: int
+    last_tune_id: int
+    first_stream_id: int
+    last_stream_id: int
+    #: Bytes the cursor moved past without ever being handed over: a backlog
+    #: longer than the cap, consumed and dropped on purpose. Deliberately kept
+    #: apart from a ring overrun, which is loss rather than policy.
+    skipped_bytes: int
+
+    @property
+    def samples(self) -> int:
+        return len(self.data) // 2
+
+    @property
+    def skipped_samples(self) -> int:
+        return int(self.skipped_bytes) // 2
+
+
 class IQRing:
     """Byte ring buffer handing contiguous IQ blocks to the decoder.
 
@@ -240,12 +344,22 @@ class IQRing:
     contiguous copy. On overflow the *oldest* data is discarded, because for a
     live view stale video is worse than a dropped frame.
 
-    Every write is stamped with the id of the tuning that produced it, and the
-    position at which that id changed is remembered. That is what lets a
-    consumer be told whether the block it was handed straddles a retune: an FM
-    discriminator carries state from one sample to the next, so a block holding
-    the tail of one frequency and the head of another cannot be demodulated as
-    one continuous stream, and no consumer can tell from the bytes alone.
+    Every write is stamped with the id of the tuning that produced it *and* the
+    id of the producing process, and the position at which either changed is
+    remembered. That is what lets a consumer be told whether the block it was
+    handed straddles a seam: an FM discriminator carries state from one sample
+    to the next, so a block holding the tail of one frequency and the head of
+    another cannot be demodulated as one continuous stream, and no consumer can
+    tell from the bytes alone. The same is true of a block that spans a transfer
+    -process restart or a replayed file's loop point: both are real
+    discontinuities and both are invisible in the samples.
+
+    The identities are recorded **at write time, from the writer**, not read
+    back later. On a HackRF that matters: the sampling thread can be blocked in
+    ``readinto`` on a process a retune has already replaced, so reading the
+    current process after the read would stamp the *old* process's samples with
+    the *new* process's identity and the seam would be recorded in the wrong
+    place -- which is to say, not recorded at all.
 
     **Two different things are counted, because they mean different things.**
     The ring is a 4 MiB history buffer and a decoder that has been running for
@@ -262,7 +376,10 @@ class IQRing:
 
     #: How many tuning transitions are remembered. Only one ring's worth of
     #: history can ever be read back, so this is a bound on how many retunes
-    #: can happen inside a single decode block, not a growing log.
+    #: can happen inside a single decode block, not a growing log. One entry
+    #: more than this may be held: the *anchor* (see :meth:`_prune_tags_locked`),
+    #: which is the identity in force at the oldest byte still in the ring and
+    #: cannot be replaced by a later entry.
     TAG_HISTORY = 64
 
     def __init__(self, size: int = RING_BYTES) -> None:
@@ -283,42 +400,90 @@ class IQRing:
         #: which of the bytes it is discarding were never offered to anybody.
         self._read_upto = 0
         self.total_written = 0
-        #: ``(byte position, tuning id)``, ascending, recording where each
-        #: tuning started writing. Positions are absolute, so they mean the same
-        #: thing as ``total_written``.
-        self._tags: list[tuple[int, int]] = []
+        #: ``(byte position, tuning id, stream id)``, ascending, recording where
+        #: each tuning started writing and which process wrote it. Positions are
+        #: absolute, so they mean the same thing as ``total_written``. The first
+        #: entry always exists once anything has been written, which is what
+        #: lets ``_tag_at`` answer for a position older than the list.
+        self._tags: list[tuple[int, int, int]] = []
 
     def _mark_read_locked(self, upto: int) -> None:
         """Record that a consumer has taken delivery up to ``upto``. Lock held."""
         if upto > self._read_upto:
             self._read_upto = int(upto)
 
-    def _loss_locked(self, oldest: int, lost: int) -> int:
+    def _loss_locked(self, oldest: int, lost: int, end: int) -> int:
         """Of ``lost`` bytes leaving the ring at ``oldest``, how many were unread.
 
         Caller holds the lock. The bytes discarded are the oldest ones, and the
         unread ones are the newest, so the two overlap only when the overrun
         reaches past everything a consumer has taken -- which is exactly the
         case that is genuine loss.
+
+        ``end`` is the absolute position just past everything written so far,
+        passed in rather than read from ``total_written`` because the counter is
+        updated after this runs, and the ceiling has to be the *new* end when an
+        oversized write has discarded a head.
         """
         if lost <= 0:
             return 0
         return max(
             0,
-            min(oldest + lost, self.total_written) - max(oldest, self._read_upto),
+            min(oldest + lost, int(end)) - max(oldest, self._read_upto),
         )
 
-    def write(self, data: bytes | memoryview, tune_id: int = 0) -> int:
+    def write(
+        self, data: bytes | memoryview, tune_id: int = 0, stream_id: int = 0
+    ) -> int:
+        """Append bytes, stamped with the tuning and process that produced them.
+
+        Returns the number of bytes *stored*. A write larger than the ring keeps
+        only its tail; the discarded head is counted in
+        :attr:`dropped_bytes`/``overwritten_bytes`` and, importantly, in the
+        absolute counters as well.
+
+        That last part used to be wrong, and it mattered. ``total_written``
+        advanced by the *retained* length, so a write too large to store left a
+        hole in the ring's own address space: the positions of everything after
+        it silently disagreed with the real length of the stream, and no consumer
+        could tell the difference between "the producer wrote nothing for a
+        while" and "the producer wrote a great deal that the ring could not
+        hold". Both the loss accounting and the drain's absolute ranges are
+        expressed in those positions, so the hole made a real, unnameable gap
+        look like a continuous stream. The counters now span the whole write,
+        discarded head included, and ``base`` below is the absolute position of
+        the first *retained* byte.
+        """
         n = len(data)
         with self._lock:
+            head = 0
             if n > self._size:
                 # Far more than we can hold; keep only the tail. The head is
                 # gone before any consumer could have seen any of this write.
-                keep = n - (self._size // 2)
-                self.dropped_bytes += keep
-                self.overwritten_bytes += keep
-                data = memoryview(data)[keep:]
+                head = n - (self._size // 2)
+                self.dropped_bytes += head
+                self.overwritten_bytes += head
+                # Everything the ring already held goes with it. Keeping the
+                # tail of this write and the head of the old contents in one
+                # buffer left the ring answering "the newest n bytes" with two
+                # different stretches of stream: the new tail, and the *old*
+                # bytes that happened to sit behind it in the buffer, presented
+                # as positions contiguous with it. Since only half a ring is
+                # stored, those old bytes survived the write untouched -- so the
+                # ring claimed a history it had just invalidated, and a decoder
+                # fed from it would have demodulated a jump as a continuous
+                # stream. Counted as loss, since the unread ones really are:
+                # they were readable until this call destroyed them.
+                if self._count:
+                    self.dropped_bytes += self._loss_locked(
+                        self.total_written - self._count, self._count, self.total_written
+                    )
+                    self.overwritten_bytes += self._count
+                    self._count = 0
+                data = memoryview(data)[head:]
                 n = len(data)
+            # Absolute position of the first byte this call actually stores.
+            base = self.total_written + head
             pos = self._wpos
             end = pos + n
             if end <= self._size:
@@ -332,18 +497,51 @@ class IQRing:
                 over = self._count + n - self._size
                 # Absolute position of the oldest byte still in the ring,
                 # which is the start of the run about to be overwritten.
-                oldest = self.total_written - self._count
-                self.dropped_bytes += self._loss_locked(oldest, over)
+                oldest = base - self._count
+                self.dropped_bytes += self._loss_locked(oldest, over, base + n)
                 self.overwritten_bytes += over
             self._count = min(self._count + n, self._size)
             # Recorded before the counter moves, because the seam belongs to the
             # first byte of *this* write, not the one after it.
-            if not self._tags or self._tags[-1][1] != tune_id:
-                self._tags.append((self.total_written, tune_id))
-                floor = self.total_written - self._size
-                self._tags = [t for t in self._tags if t[0] >= floor][-self.TAG_HISTORY :]
-            self.total_written += n
+            if (not self._tags
+                    or self._tags[-1][1] != tune_id
+                    or self._tags[-1][2] != stream_id):
+                self._tags.append((base, int(tune_id), int(stream_id)))
+                self._prune_tags_locked(base)
+            self.total_written = base + n
         return n
+
+    def _prune_tags_locked(self, base: int) -> None:
+        """Drop the seams the ring can no longer answer for. Lock held.
+
+        A tag may be dropped only once every byte it describes has left the ring:
+        below that point it is still the identity in force at the head of the
+        buffer, and :meth:`_tag_at` needs it to answer for those bytes.
+
+        The *anchor* -- the newest tag older than the oldest byte still held --
+        is therefore kept, deliberately, and the rest is bounded by
+        :attr:`TAG_HISTORY`. Without it the tag list becomes empty on a long
+        unchanged stream (which is every healthy stream: the first tag falls
+        below the floor one ring-length in), and the *next* retune then becomes
+        the oldest tag. At that point a read of the retained tail is answered
+        with the new tuning's identity -- the old bytes are labelled as samples
+        of a frequency they were not recorded at -- and a snapshot that
+        straddles the retune reports one identity at both ends and no seam at
+        all, which is the one answer that would have a decoder demodulate two
+        frequencies as one stream.
+        """
+        floor = base - self._size
+        anchor: tuple[int, int, int] | None = None
+        kept: list[tuple[int, int, int]] = []
+        for tag in self._tags:
+            if tag[0] < floor:
+                anchor = tag                     # the newest one below the floor
+            else:
+                kept.append(tag)
+        kept = kept[-self.TAG_HISTORY:]
+        if anchor is not None and (not kept or kept[0][0] != anchor[0]):
+            kept.insert(0, anchor)
+        self._tags = kept
 
     def available(self) -> int:
         with self._lock:
@@ -366,16 +564,40 @@ class IQRing:
         first = self._size - start
         return bytearray(self._buf[start:] + self._buf[: n - first])
 
-    def _tag_at(self, pos: int) -> int:
-        """The tuning that was in effect at byte position ``pos``. Lock held."""
+    def _tag_at(self, pos: int) -> tuple[int, int]:
+        """``(tuning, producing process)`` in effect at byte position ``pos``.
+
+        Lock held. Positions older than the oldest recorded seam belong to that
+        seam's entry, which is what the floor in :meth:`write` preserves.
+        """
         if not self._tags:
-            return 0
-        tag = self._tags[0][1]
-        for p, t in self._tags:
+            return (0, 0)
+        tune = self._tags[0][1]
+        stream = self._tags[0][2]
+        for p, t, s in self._tags:
             if p > pos:
                 break
-            tag = t
-        return tag
+            tune, stream = t, s
+        return (tune, stream)
+
+    def diag_tags(self) -> tuple[tuple[int, int], ...]:
+        """TEMP DIAG: a copy of the recorded ``(position, tuning id)`` seams.
+
+        This is the evidence for "was anything spliced across a retune". A
+        consumer cannot infer it from the bytes -- two frequencies look like two
+        frequencies -- and the hand-over ids only say whether *this* block
+        straddled a seam, not whether one happened just before it.
+
+        Pairs only, for the callers that read this; :meth:`diag_seams` has the
+        stream identity as well.
+        """
+        with self._lock:
+            return tuple((p, t) for p, t, _s in self._tags)
+
+    def diag_seams(self) -> tuple[tuple[int, int, int], ...]:
+        """TEMP DIAG: the seams as ``(position, tuning id, stream id)``."""
+        with self._lock:
+            return tuple(self._tags)
 
     def read_newest(self, n: int) -> bytearray:
         """Newest ``n`` bytes, oldest-first. Returns fewer if that is all there is.
@@ -391,24 +613,56 @@ class IQRing:
                 self._mark_read_locked(self.total_written)
             return data
 
-    def read_since(
-        self, cursor: int, max_bytes: int
-    ) -> tuple[bytearray, int, int, int]:
+    def snapshot_newest(self, max_bytes: int) -> RingSnapshot:
+        """Newest ``max_bytes`` bytes plus the absolute range and tuning they cover.
+
+        One acquisition of the lock returns the bytes *and* the range they came
+        from, so the two cannot disagree: there is no window in which a write
+        lands between reading the counter and reading the data, which is the loss
+        :meth:`read_since` exists to make impossible for the streaming path.
+
+        It deliberately does **not** move the loss accounting. That is the whole
+        difference from :meth:`read_newest`, which counts as consumption because
+        whatever the caller looked at it will not be asked for again. This one is
+        a look: the diagnostic dump reads the ring and the decoder still gets
+        every sample it would have got, and an overrun that destroys bytes the
+        dump has already written must still count as loss against the decoder
+        that had not read them yet.
+
+        Bytes come out oldest-first and are contiguous -- the newest ``n`` bytes
+        of a ring are one run, never two -- so ``last_byte - first_byte`` is the
+        length of the file that gets written, with no stitching.
+        """
+        with self._lock:
+            data = self._newest_locked(int(max_bytes))
+            last = self.total_written
+            first = last - len(data)
+            first_tune, first_stream = self._tag_at(first)
+            last_tune, last_stream = self._tag_at(last)
+            return RingSnapshot(
+                bytes(data),
+                first,
+                last,
+                first_tune,
+                last_tune,
+                first_stream,
+                last_stream,
+            )
+
+    def read_since(self, cursor: int, max_bytes: int) -> RingRead:
         """Unconsumed bytes since ``cursor``, with everything a consumer needs.
 
-        Returns ``(data, new_cursor, first_tune_id, last_tune_id)``.
-
-        All four come out of *one* acquisition of the lock, and that is the whole
-        point of the method existing. The previous shape of this was two calls:
-        read the write counter, then read the data. A write landing between them
-        was counted as consumed by the first call and never handed over by the
-        second -- samples lost, silently, on a live stream.
+        :meth:`IQSource.drain_block` documents why this returns a record rather
+        than a tuple: the data, the new cursor, the absolute range and the two
+        identities at each end of it all come out of *one* acquisition of the
+        lock, and cannot be made to disagree by a write landing in between.
 
         The new cursor is the write position observed under that same lock, so
         whatever was written while this block was being copied is *not* counted
         as consumed and comes round on the next call. A backlog longer than
         ``max_bytes`` is consumed and dropped, as documented on
-        :meth:`IQSource.drain_iq`.
+        :meth:`IQSource.drain_block`, and the size of that drop travels with the
+        record rather than only being counted.
         """
         with self._lock:
             written = self.total_written
@@ -421,7 +675,19 @@ class IQRing:
             # overrun must not count it again as data nobody read.
             self._mark_read_locked(written)
             first_pos = written - len(data)
-            return data, written, self._tag_at(first_pos), self._tag_at(written)
+            first_tune, first_stream = self._tag_at(first_pos)
+            last_tune, last_stream = self._tag_at(written)
+            return RingRead(
+                data=data,
+                cursor=written,
+                first_byte=first_pos,
+                last_byte=written,
+                first_tune_id=first_tune,
+                last_tune_id=last_tune,
+                first_stream_id=first_stream,
+                last_stream_id=last_stream,
+                skipped_bytes=max(0, pending - n),
+            )
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +853,34 @@ def _u8_to_iq(
     return iq
 
 
+def _whole_pairs(view) -> tuple[memoryview, bytes]:
+    """Split a buffer into whole I/Q pairs plus at most one dangling byte.
+
+    ``view`` is the bytes just received, *including* any byte carried over from
+    the previous read. Returns ``(even-length prefix, remainder)``, the
+    remainder being ``b""`` or the single byte that has no partner yet.
+
+    The ring is a byte stream and :func:`_u8_to_iq` pairs it from the front, so
+    it only ever holds whole samples if every producer hands it an even number
+    of bytes. A pipe read can end anywhere -- an odd count is a routine, legal
+    answer from ``readinto`` -- and dropping its last byte lost half a sample:
+    the next read began with a Q where an I belonged, so every pair after that
+    was built from two halves of different samples. Nothing downstream could
+    say so. The ranges stayed adjacent, the byte counts still added up, and the
+    decode quietly lost a little of its own frequency every time it happened.
+
+    The odd byte is therefore carried forward rather than dropped, and only ever
+    to a read *of the same producer*: a replacement process starts a new
+    recording whose first byte is an I, and gluing the outgoing process's
+    dangling half to it would fabricate exactly the pair this exists to prevent.
+    :meth:`IQSource._take_carry` and :meth:`IQSource._keep_pairs` hold that half
+    of the rule.
+    """
+    if len(view) & 1:
+        return view[:-1], bytes(view[-1:])
+    return view, b""
+
+
 @dataclass(frozen=True)
 class EncodingVerdict:
     """What the histogram could and could not establish about a recording.
@@ -655,6 +949,156 @@ def detect_iq_encoding(raw: bytes | bytearray | memoryview) -> EncodingVerdict:
     )
 
 
+@dataclass(frozen=True)
+class IQBlock:
+    """One hand-over of IQ, with the position and identity of the samples.
+
+    The decoder cannot decide whether it may carry state across from the previous
+    block out of the samples. Two frequencies look like two frequencies; a block
+    either side of a transfer-process restart looks like one continuous stream.
+    So the two facts that decide it travel with the data:
+
+    * ``[first_sample, last_sample)`` -- absolute, half-open, on the ring's
+      monotonic write counter. Adjacent means ``first_sample == previous
+      last_sample``, and a sample *missing* between two blocks is a gap of
+      exactly the right size rather than an unfalsifiable assumption that there
+      was none.
+    * ``first_stream_id``/``last_stream_id`` and ``first_tune_id``/
+      ``last_tune_id`` -- who produced the samples at each end. Differing ids at
+      *either* pair of ends are an internal seam (:attr:`seam`), which is not a
+      gap but a mixture: it must be refused outright rather than counted.
+
+    An **empty** delivery is a real answer, not an error: nothing arrived. It
+    reports a zero-length range at the read cursor and must not be mistaken for
+    a boundary, which is why consumers are told to leave their bookkeeping alone
+    when :attr:`empty` is true.
+
+    ``first_sample < 0`` means the position is *unknown* -- a source that offers
+    samples without a position (a bare array, a test double). That is
+    distinguished from a known range of zero length, because "I cannot place
+    these samples in the stream" and "these samples are an empty span" must not
+    be allowed to look alike.
+    """
+
+    iq: np.ndarray
+    first_sample: int
+    last_sample: int
+    first_stream_id: int
+    last_stream_id: int
+    first_tune_id: int
+    last_tune_id: int
+    sample_rate: int = 0
+    encoding: "IQEncoding | None" = None
+    #: Samples the read cursor moved past without delivering: a backlog longer
+    #: than the cap. Policy, not loss.
+    skipped_samples: int = 0
+    #: Why the previous span ended, when a reset said so ("retune", "seam",
+    #: "overload", ...). Empty otherwise.
+    reset_reason: str = ""
+    #: Monotonic per-source hand-over number, so a consumer can tell one
+    #: delivery from another even when both are empty.
+    delivery: int = 0
+
+    @property
+    def samples(self) -> int:
+        return int(self.iq.size)
+
+    @property
+    def known(self) -> bool:
+        """Whether the absolute position of these samples is known."""
+        return self.first_sample >= 0
+
+    @property
+    def empty(self) -> bool:
+        return self.iq.size == 0
+
+    def drop_head(self, n: int) -> "IQBlock":
+        """This block without its first ``n`` samples, at the matching position.
+
+        Everything that describes the *span* travels with it -- the absolute
+        range moves up by ``n`` and the identities of the two ends are the same
+        identities, because dropping samples cannot change who produced them.
+        The block's provenance is the point of the type, so a shortened copy
+        that kept the old ``first_sample`` would place the remaining samples
+        ``n`` positions too early.
+
+        Returns the same block when ``n`` is zero or negative, so a caller can
+        subtract a repeat of unknown size without branching.
+        """
+        cut = max(0, min(int(n), self.samples))
+        if not cut:
+            return self
+        return IQBlock(
+            iq=self.iq[cut:],
+            first_sample=self.first_sample + cut if self.known else -1,
+            last_sample=self.last_sample,
+            first_stream_id=self.first_stream_id,
+            last_stream_id=self.last_stream_id,
+            first_tune_id=self.first_tune_id,
+            last_tune_id=self.last_tune_id,
+            sample_rate=self.sample_rate,
+            encoding=self.encoding,
+            skipped_samples=self.skipped_samples,
+            reset_reason=self.reset_reason,
+            delivery=self.delivery,
+        )
+
+    @property
+    def spans_stream(self) -> bool:
+        return self.first_stream_id != self.last_stream_id
+
+    @property
+    def spans_tune(self) -> bool:
+        return self.first_tune_id != self.last_tune_id
+
+    @property
+    def seam(self) -> str:
+        """Why this block cannot be decoded as one stream, or ``""``.
+
+        Both ids are checked at both ends. A block that holds the tail of one
+        producer and the head of another is a mixture: the samples on either
+        side of the boundary are each fine, and together they are a picture
+        assembled out of two different pictures. Refusing the whole block is the
+        only honest option.
+        """
+        if self.spans_stream:
+            return "stream"
+        if self.spans_tune:
+            return "tune"
+        return ""
+
+    @property
+    def out_of_range(self) -> bool:
+        """A range that cannot be true: backwards, negative, or unknown."""
+        return self.first_sample < 0 or self.last_sample < self.first_sample
+
+    @classmethod
+    def orphan(
+        cls,
+        iq: np.ndarray,
+        sample_rate: int = 0,
+        encoding: "IQEncoding | None" = None,
+    ) -> "IQBlock":
+        """A block from a source that offers samples but no position or identity.
+
+        Used for the duck-typed source that only implements :meth:`drain_iq`.
+        Nothing about it can be proven, so ``first_sample < 0`` and a consumer
+        has to treat it as the start of its own segment rather than as a
+        continuation of whatever came before.
+        """
+        return cls(
+            iq=iq,
+            first_sample=-1,
+            last_sample=-1,
+            first_stream_id=0,
+            last_stream_id=0,
+            first_tune_id=0,
+            last_tune_id=0,
+            sample_rate=int(sample_rate),
+            encoding=encoding,
+        )
+
+
 class IQSource(ABC):
     """Common interface: background thread fills an :class:`IQRing` with IQ."""
 
@@ -697,6 +1141,13 @@ class IQSource(ABC):
         self._thread: threading.Thread | None = None
         self._tune_lock = threading.Lock()
         self._consumed = 0
+        #: The trailing byte of a producer's last read, and which producer it
+        #: belongs to. Zero or one byte, and every producer that fills the ring
+        #: with bytes must go through :meth:`_take_carry`/:meth:`_keep_pairs` so
+        #: the ring never holds half a sample -- see :func:`_whole_pairs` for
+        #: what a dangling byte does to the pairing if it is dropped instead.
+        self._carry_byte: bytes = b""
+        self._carry_owner: object = None
         #: Serialises the drain cursor. The cursor is a single value read by
         #: :meth:`drain_iq` and moved by :meth:`reset_drain`, and both run on
         #: different threads (decoder, and a retune racing a scan). Without this,
@@ -709,12 +1160,83 @@ class IQSource(ABC):
         #: was handed straddles a retune. The discriminator carries state from
         #: sample to sample and cannot demodulate such a block as one stream.
         self._tune_id = 0
-        #: Tuning ids of the last :meth:`drain_iq` hand-over, for the same
-        #: reason the ids exist in the ring. Kept beside the drain rather than
-        #: returned: :meth:`drain_iq` returns samples, and every caller of it
-        #: treats that as the whole answer.
+        #: Stream identity: bumped whenever the *producer* is replaced rather
+        #: than re-tuned -- a transfer process spawned or restarted, a replayed
+        #: file passing its end, a source started afresh. It is the other half
+        #: of the seam test, and it is the half that a tuning id cannot cover: a
+        #: retune restarts the HackRF process, so two runs at the same frequency
+        #: with the same tuning id are still two runs, and the samples either
+        #: side of the restart are not one stream.
+        self._stream_seq = 0
+        self._stream_lock = threading.Lock()
+        self._stream_id = 0
+        self._deliveries = 0
+        #: Why the previous span was abandoned, as recorded by
+        #: :meth:`reset_drain`. Carried on the *next* delivery so a consumer can
+        #: tell "the stream broke" from "somebody asked for a clean start".
+        self._drain_reset_reason = ""
+        #: The most recent structured hand-over. Kept beside the drain for the
+        #: same reason :attr:`last_drain_tune_ids` is: callers want the facts
+        #: about the block they just asked for, and a second, independent query
+        #: would be exactly the race this API exists to remove.
+        self._last_delivery: IQBlock | None = None
+        #: Tuning ids of the last hand-over, kept for the same reason the ids
+        #: exist in the ring.
         self.last_drain_tune_ids: tuple[int, int] = (0, 0)
         self._timer = TimerResolution()
+        # TEMP DIAG. ``_drain_last_end`` is the absolute write position the
+        # previous hand-over reached, so the gap between one delivery and the
+        # next is measurable rather than inferred; the two marks turn the ring's
+        # cumulative overrun counters into per-hand-over deltas. ``process_epoch``
+        # counts transfer-process generations (a HackRF retune restarts the
+        # child), which is the identity a decode has to be attributed to when
+        # several tunings share one tuning id.
+        self._diag = diag.section("iq")
+        self._drain_last_end = 0
+        self._drain_drop_mark = 0
+        self._drain_over_mark = 0
+        self.process_epoch = 0
+        self.reclaims = 0
+
+    # -- whole-sample discipline --------------------------------------------
+    #
+    # Two methods, so that no producer can fill the ring with a half sample by
+    # accident. ``_take_carry`` is called before a read and ``_keep_pairs``
+    # after it; between them the buffer begins with whatever the previous read
+    # left over, and the pair split happens once, in one place.
+
+    def _take_carry(self, owner: object, into: bytearray | None = None) -> bytes:
+        """The byte held back from ``owner``'s previous read, if it is ours.
+
+        ``owner`` is whatever identifies the producer -- the transfer process
+        for hardware, the stream id for a replay -- and is what scopes the byte:
+        a byte from a producer that has been replaced is dropped instead, because
+        the replacement's stream starts on a sample boundary of its own.
+
+        ``into``, when given, receives the byte (a producer reading into a fixed
+        buffer puts it in the buffer's first byte and reads after it, so no copy
+        of the payload is made); the byte is also returned for the producers that
+        concatenate.
+        """
+        byte = b""
+        if self._carry_owner is owner and self._carry_byte:
+            byte = self._carry_byte
+            if into is not None:
+                into[0] = byte[0]
+        self._carry_byte = b""
+        self._carry_owner = None
+        return byte
+
+    def _keep_pairs(self, data, owner: object) -> memoryview:
+        """Split off a dangling byte, keep it for ``owner``, return the pairs.
+
+        ``data`` is what was received *including* any byte :meth:`_take_carry`
+        returned. The returned prefix has an even length and is what may be
+        written to the ring; anything left over is remembered against ``owner``.
+        """
+        pairs, self._carry_byte = _whole_pairs(data)
+        self._carry_owner = owner if self._carry_byte else None
+        return pairs
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -723,9 +1245,35 @@ class IQSource(ABC):
             return
         self._stop.clear()
         self.stats = SourceStats()
+        self.process_epoch += 1          # TEMP DIAG: a new reader generation
+        # A fresh reader is a fresh stream, whatever it turns out to read.
+        # Nothing written before this can be a continuation of what comes after
+        # it, and the ids are how a consumer learns that.
+        self._begin_stream()
         self._timer.acquire()
         self._thread = threading.Thread(target=self._run, name=f"iq-{self.kind}", daemon=True)
         self._thread.start()
+
+    # -- stream identity ---------------------------------------------------
+
+    @property
+    def stream_id(self) -> int:
+        """Identity of the stream currently being produced."""
+        return self._stream_id
+
+    def _begin_stream(self) -> int:
+        """Start a new stream identity and return it.
+
+        Every call is a place where "the samples after this are a continuation
+        of the samples before it" stops being true, whatever produced them: a
+        transfer process spawned, a replayed file passing its end, a restarted
+        reader. The id goes into the ring with each write, stamped by the
+        writer, so it describes the bytes rather than the moment they were read.
+        """
+        with self._stream_lock:
+            self._stream_seq += 1
+            self._stream_id = self._stream_seq
+            return self._stream_id
 
     def stop(self) -> None:
         self._stop.set()
@@ -758,6 +1306,7 @@ class IQSource(ABC):
 
     def reclaim_device(self) -> bool:
         """Take hardware back after :meth:`release_device`. Always True here."""
+        self.reclaims += 1               # TEMP DIAG: reclaim without an epoch bump
         return True
 
     @abstractmethod
@@ -812,6 +1361,7 @@ class IQSource(ABC):
             # applied a tune at all, and there the pre-request value is the more
             # truthful of the two.
             self.frequency_hz = self._applied_hz or previous
+            self._diag.bump("tune_refused")       # TEMP DIAG
             return False
         # Recorded here rather than in each subclass, because several of them
         # legitimately short-circuit -- before the reader thread exists, or
@@ -826,6 +1376,13 @@ class IQSource(ABC):
         # labelling it as a new tuning would make the decoder drop a perfectly
         # continuous stream for no reason.
         self._tune_id += 1
+        # TEMP DIAG: seams are counted whether or not anything reads them, and
+        # a refused tune is counted separately -- a sweep that keeps being
+        # refused looks identical to one that keeps retuning until the decoder
+        # drops a third of its samples.
+        self._diag.bump("tune_applied")
+        self._diag.gauge("tune_id", self._tune_id)
+        self._diag.gauge("applied_hz", self._applied_hz)
         return True
 
     def _apply_tune(self) -> bool:
@@ -858,13 +1415,84 @@ class IQSource(ABC):
         (the settled-capture path, tests) need that and must not be surprised by
         a cursor they did not move. Streaming consumers use :meth:`drain_iq`.
         """
+        if diag.dump_enabled():
+            # TEMP DIAG: the settled-capture path never calls drain_iq, so
+            # without this the dump would sit untriggered for every caller that
+            # reads this way. Same non-consuming snapshot either path takes.
+            diag.dump_tick(self._dump_snapshot)
         raw = self.ring.read_newest(int(n_samples) * 2)
         if len(raw) < 16:
             return np.zeros(0, dtype=np.complex64)
         return _u8_to_iq(raw, self.encoding)
 
+    def _dump_snapshot(self, max_samples: int) -> tuple[bytes, dict]:
+        """TEMP DIAG: the newest ``max_samples`` in the ring, and what they are.
+
+        Returns the bytes and a metadata dict. The bytes and the absolute range
+        they occupy come from one acquisition of the ring's lock
+        (:meth:`IQRing.snapshot_newest`), so the numbers beside them describe
+        exactly those bytes -- and nothing here moves the loss accounting, so
+        reading the dump does not make the decoder's own accounting look better
+        than it was.
+
+        The metadata names the tuning and the producing process at each end of
+        the range rather than one of each for the whole file. A snapshot that
+        straddles a retune holds two frequencies, which no offline reader can
+        see in the samples, so :attr:`RingSnapshot.spans_tune` is passed on and
+        the segment is labelled rather than written as if it were continuous.
+        A snapshot that straddles a process restart has the same problem for the
+        same reason, which is :attr:`RingSnapshot.spans_stream`.
+        """
+        snap = self.ring.snapshot_newest(int(max_samples) * 2)
+        return snap.data, {
+            "sample_rate": self.sample_rate,
+            "encoding": self.encoding.value,
+            "kind": self.kind,
+            "frequency_hz": self._applied_hz,
+            "tune_id": snap.last_tune_id,
+            "first_tune_id": snap.first_tune_id,
+            "last_tune_id": snap.last_tune_id,
+            "spans_tune": snap.spans_tune,
+            "stream_id": snap.last_stream_id,
+            "first_stream_id": snap.first_stream_id,
+            "last_stream_id": snap.last_stream_id,
+            "spans_stream": snap.spans_stream,
+            "epoch": self.process_epoch,
+            "first_byte": snap.first_byte,
+            "last_byte": snap.last_byte,
+        }
+
     def drain_iq(self, max_samples: int = 300_000) -> np.ndarray:
-        """Return the newest unconsumed samples, each handed over exactly once.
+        """Newest unconsumed samples, each handed over exactly once.
+
+        The samples-only view of :meth:`drain_block`, for callers that do not
+        need to know where the samples came from: a settled-capture reader, a
+        power measurement, an offline tool. A streaming *decoder* wants the other
+        one, because only that can say whether this block continues the previous
+        one or starts a new stream.
+
+        TEMP DIAG: the bounded dump is driven from :meth:`drain_block`, before
+        anything is consumed, so it sees the whole ring rather than the leftover
+        after this drain.
+        """
+        return self.drain_block(max_samples).iq
+
+    def drain_block(self, max_samples: int = 300_000) -> IQBlock:
+        """Newest unconsumed samples *and* what they are.
+
+        This is the delivery API a streaming consumer uses, and every field of
+        the returned record comes out of one acquisition of the ring's lock:
+
+        * the samples, and the absolute half-open range
+          ``[first_sample, last_sample)`` they occupy on the ring's monotonic
+          write counter -- so two hand-overs can be *tested* for adjacency
+          instead of assumed to be;
+        * the stream and tuning identity at each end, so a block that straddles
+          a retune or a transfer-process restart is recognised as a mixture and
+          refused rather than demodulated as one stream;
+        * the sample rate and byte encoding, both properties of the producer
+          rather than of the array;
+        * how many samples the cursor moved past without delivering.
 
         A streaming decoder must consume each sample exactly once: re-reading a
         snapshot would re-demodulate the same data every frame, and any
@@ -889,7 +1517,9 @@ class IQSource(ABC):
         Measured, that turned a 23 ms/field decoder into a 3-second lag while the
         live view showed older and older video. A live viewer should show the
         newest picture it can decode and drop what it cannot keep up with, so the
-        default is a little over one field's worth.
+        default is a little over one field's worth. The size of that drop is
+        reported as :attr:`IQBlock.skipped_samples`, and it is a *policy* number:
+        it is kept apart from a ring overrun, which is loss.
 
         The cursor tracks the ring's absolute write counter, which is monotonic
         and never wraps, so there is no wraparound case to reason about. A
@@ -897,41 +1527,166 @@ class IQSource(ABC):
         and the cursor is advanced to the present so the lost span is not
         re-requested forever.
 
-        The data, the new cursor and the tuning ids of the block are read in one
-        go under the ring's lock, and recorded on :attr:`last_drain_tune_ids`.
-        That is the fix for a loss that used to be unavoidable: reading the
-        counter and then the bytes let a write landing in between be marked
-        consumed and never handed over. Doing it in two calls cannot be made
-        correct, only less likely.
+        Reading the counter and the bytes in two calls cannot be made correct,
+        only less likely: a write landing in between was counted as consumed by
+        the first call and never handed over by the second -- samples lost,
+        silently, on a live stream. One lock acquisition is the whole reason the
+        range, the identities and the samples are in a single record.
+
+        Nothing about the returned block depends on the TEMP DIAG dump being on.
         """
+        if diag.dump_enabled():
+            diag.dump_tick(self._dump_snapshot)
         want = int(max_samples) * 2
         with self._drain_lock:
-            raw, written, first_id, last_id = self.ring.read_since(
-                self._consumed, want
+            cursor = int(self._consumed)
+            read = self.ring.read_since(cursor, want)
+            self._consumed = read.cursor
+            self.last_drain_tune_ids = (read.first_tune_id, read.last_tune_id)
+            iq = (
+                _u8_to_iq(read.data, self.encoding)
+                if len(read.data) >= 16
+                else np.zeros(0, dtype=np.complex64)
             )
-            self._consumed = written
-            self.last_drain_tune_ids = (first_id, last_id)
-        if len(raw) < 16:
-            return np.zeros(0, dtype=np.complex64)
-        return _u8_to_iq(raw, self.encoding)
+            self._deliveries += 1
+            block = IQBlock(
+                iq=iq,
+                first_sample=read.first_byte // 2,
+                last_sample=read.last_byte // 2,
+                first_stream_id=read.first_stream_id,
+                last_stream_id=read.last_stream_id,
+                first_tune_id=read.first_tune_id,
+                last_tune_id=read.last_tune_id,
+                sample_rate=self.sample_rate,
+                encoding=self.encoding,
+                skipped_samples=read.skipped_samples,
+                reset_reason=self._drain_reset_reason,
+                delivery=self._deliveries,
+            )
+            # Cleared inside the lock, so a reason belongs to exactly one
+            # delivery: two consumers draining concurrently would otherwise see
+            # the same one twice, and neither could say which hand-over it
+            # described.
+            self._drain_reset_reason = ""
+            self._last_delivery = block
+            # TEMP DIAG: absolute ranges in, counts out. Read inside the same
+            # lock as the data, so the numbers cannot disagree with the block.
+            self._diag_drain(cursor, read, block)
+        return block
 
-    def reset_drain(self) -> None:
+    def last_delivery(self) -> IQBlock | None:
+        """The most recent :meth:`drain_block`, or None before the first.
+
+        For a consumer that already holds the samples and wants their metadata.
+        It carries a delivery number, so a caller can tell whether it is looking
+        at the hand-over it asked for or at a later one -- which is the
+        difference between "these bytes have no position" and "about to describe
+        somebody else's bytes".
+        """
+        with self._drain_lock:
+            return self._last_delivery
+
+    def _diag_drain(self, cursor: int, read: RingRead, block: IQBlock) -> None:
+        """TEMP DIAG: account for one hand-over. Counts only.
+
+        ``read_since`` takes the newest ``min(pending, max_bytes)`` and then
+        moves the cursor to the present, so a backlog longer than the cap is
+        consumed and dropped without being named anywhere. That drop is
+        invisible from outside -- the block looks like any other -- and it is
+        exactly what would silently eat the head of a field. So it is counted
+        here, per hand-over, together with the absolute byte range delivered and
+        the gap between consecutive hand-overs, which together say whether the
+        decoder saw a continuous stream.
+        """
+        d = self._diag
+        ring = self.ring
+        samples = block.samples
+        # In samples, like everything else counted here. The byte positions were
+        # kept in a counter named ``..._samples``, next to ``delivered_samples``
+        # and ``skipped_samples`` which are halved, so a drain of a megabyte
+        # reported twice the samples it delivered.
+        pending = max(0, int(read.cursor) - int(cursor)) // 2
+        skipped = int(read.skipped_samples)
+        d.bump("drains")
+        d.bump("pending_samples", pending)
+        d.bump("delivered_samples", samples)
+        d.gauge("read_samples_last", samples)
+        d.hist("read_kib", samples >> 10)
+        if skipped:
+            d.bump("skip_events")
+            d.bump("skipped_samples", skipped)
+            d.hist("skip_kib", skipped >> 11)
+        if block.reset_reason:
+            d.bump("reset_reason_drains")
+            d.gauge("reset_reason", block.reset_reason)
+        if self._drain_last_end and read.first_byte > self._drain_last_end:
+            gap = read.first_byte - self._drain_last_end
+            # Delivery did not resume where it stopped. Normally this is
+            # exactly the capped skip just counted -- the two are the same
+            # quantity when the cursor is where the last hand-over left it,
+            # so their equality is the invariant worth reading. They part
+            # company when the cursor moved without a delivery (a
+            # reset_drain), which is precisely when they differ.
+            d.bump("range_gap_events")
+            d.bump("range_gap_samples", gap // 2)
+            d.hist("gap_kib", gap >> 11)
+        self._drain_last_end = read.cursor
+        dropped = ring.dropped_bytes - self._drain_drop_mark
+        self._drain_drop_mark = ring.dropped_bytes
+        if dropped > 0:
+            d.bump("overrun_events")
+            d.bump("dropped_samples", dropped // 2)
+        over = ring.overwritten_bytes - self._drain_over_mark
+        self._drain_over_mark = ring.overwritten_bytes
+        if over > 0:
+            d.bump("overwritten_samples", over // 2)
+        d.gauge("written_bytes", read.cursor)
+        d.gauge("tune_id_first", read.first_tune_id)
+        d.gauge("tune_id_last", read.last_tune_id)
+        d.gauge("stream_id_first", read.first_stream_id)
+        d.gauge("stream_id_last", read.last_stream_id)
+        d.gauge("epoch", self.process_epoch)
+        d.gauge("reclaims", self.reclaims)
+        d.gauge("ring_seams", len(ring.diag_seams()))
+
+    def reset_drain(self, reason: str = "") -> None:
         """Discard everything buffered so far without handing it to a decoder.
 
         This is a real read boundary now, not a counter nobody reads: the next
-        :meth:`drain_iq` returns nothing until genuinely new samples arrive.
+        :meth:`drain_block` returns nothing until genuinely new samples arrive.
         Used on retune, so a decoder cannot splice the tail of one frequency
         onto the head of the next.
 
-        Shares :attr:`_drain_lock` with :meth:`drain_iq`, and reads the counter
+        ``reason`` is a short label carried on the *next* delivery, so a consumer
+        can tell "the stream broke on its own" from "somebody asked for a clean
+        start here". It is diagnostics, never control: nothing is refused because
+        of it.
+
+        Shares :attr:`_drain_lock` with :meth:`drain_block`, and reads the counter
         through the ring rather than touching ``total_written`` directly. A reset
         that landed between a drain's read of the counter and its read of the
         data moved the cursor underneath the copy already in flight, and the
         caller received pre-reset samples believing they were post-reset -- the
         exact splice this method exists to prevent, arriving through the seam.
+
+        A reset that discards a span leaves a real gap, and the next delivery
+        reports it as one: the cursor moved, so ``first_sample`` is past the last
+        hand-over's end by exactly the discarded size. That is the honest
+        accounting -- the samples exist nowhere else -- and it is why the size is
+        counted here as well as inferred from the range.
         """
         with self._drain_lock:
-            self._consumed = self.ring.write_position()
+            # TEMP DIAG: one read of the counter, as before; the discarded
+            # span is derived from it rather than from a second read that
+            # could land on a different value.
+            written = self.ring.write_position()
+            discarded = max(0, written - self._consumed)
+            self._consumed = written
+            if reason:
+                self._drain_reset_reason = str(reason)
+        self._diag.bump("drain_resets")
+        if discarded:
+            self._diag.bump("reset_discarded_samples", discarded // 2)
 
     def wait_for_bytes(self, n_bytes: int, timeout: float = 2.0) -> bool:
         """Block until the ring's write counter has advanced by ``n_bytes``."""
@@ -1079,6 +1834,16 @@ class HackrfSource(IQSource):
             bufsize=0,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        # The stream identity belongs to *this process*, not to whatever is
+        # current at the moment its samples are read. A retune kills the old
+        # process and installs a new one while the sampling thread is still
+        # blocked in readinto() on the old one's pipe, so the thread wakes up
+        # afterwards with bytes from the old transfer. Stamping them with
+        # ``self.stream_id`` -- the new process's -- would record the restart in
+        # the wrong place, which is to say nowhere: the seam would fall in the
+        # gap between the two processes' own writes and the block holding it
+        # would look continuous. So the id travels with the handle it describes.
+        setattr(self._proc, "_fpv_stream_id", self._begin_stream())
         # stderr gets its own thread, and it has to. `bufsize=0` means the
         # stderr handle is a raw FileIO with no read1(), so a drain on the
         # sampling thread has to use read(n) -- and read() on a pipe blocks
@@ -1094,6 +1859,11 @@ class HackrfSource(IQSource):
         )
         self._err_thread.start()
         self.stats.running = True
+        # TEMP DIAG: every spawn is a new process identity, and a retune is a
+        # spawn. The tuning id says the air changed; this says the process did.
+        self.process_epoch += 1
+        self._diag.bump("spawns")
+        self._diag.gauge("epoch", self.process_epoch)
 
     def _spawn_settled(self) -> bool:
         """Start a transfer and do not return until it is genuinely receiving.
@@ -1280,6 +2050,8 @@ class HackrfSource(IQSource):
         """
         with self._tune_lock:
             self._released = False
+            self.reclaims += 1           # TEMP DIAG: see IQSource.reclaim_device
+            self._diag.bump("reclaims")
             if self._proc is not None:
                 return True
             if not self._thread:
@@ -1423,8 +2195,19 @@ class HackrfSource(IQSource):
             if p is None or p.stdout is None:
                 self._stop.wait(0.02)
                 continue
+            # Captured *before* the read, from the process being read, and used
+            # whatever happens to `self._proc` while this call is in flight. See
+            # _spawn: a replacement installed mid-read must not stamp these
+            # bytes.
+            stream_id = int(getattr(p, "_fpv_stream_id", 0))
+            tune_id = self._tune_id
+            # A read can end mid-sample; the byte it leaves behind goes back into
+            # the front of the buffer so the next read completes that pair. It
+            # is taken only if it belongs to *this* process -- a replacement
+            # producer's stream starts on a sample boundary of its own.
+            held = self._take_carry(p, into=self._block)
             try:
-                n = p.stdout.readinto(self._view)
+                n = p.stdout.readinto(self._view[1 if held else 0:])
             except Exception as exc:
                 self.stats.read_errors += 1
                 if self._proc is p:
@@ -1434,11 +2217,18 @@ class HackrfSource(IQSource):
                 continue
             if not n:
                 # EOF: this process has finished. Close its stdout here, on the
-                # thread that was the one reading it.
+                # thread that was the one reading it. Any half-sample it left
+                # behind has no partner coming and went with the pipe.
                 self._close_quietly(p.stdout)
                 self._kill(p)
                 continue
-            self.ring.write(self._view[:n], self._tune_id)
+            # Whole pairs only: the ring de-interleaves from the front, so a
+            # dangling byte here would mis-pair every sample after it. The held
+            # byte sits at index 0 and the read landed immediately after it, so
+            # the bytes to consider are ``_view[:len(held) + n]`` -- counted from
+            # the front, because the pair split has to see the held byte too.
+            pairs = self._keep_pairs(self._view[: len(held) + n], p)
+            self.ring.write(pairs, tune_id, stream_id)
             self.stats.bytes_total += n
         self.stats.running = False
 
@@ -1603,6 +2393,14 @@ class FileSource(IQSource):
         # a catch-up chunk instead of a permanently late stream.
         deadline = time.perf_counter()
         while not self._stop.is_set():
+            # Each pass over the file is a new stream, and it has to say so. A
+            # looping replay hands over the end of one recording and the start
+            # of another with no gap in the ring and no retune: the positions
+            # are perfectly adjacent and the samples are not one recording, and
+            # nothing but the file's own EOF says so. (An un-looped replay ends
+            # the stream instead, which is the same boundary seen from the other
+            # side.)
+            stream_id = self._begin_stream()
             with open(self.path, "rb", buffering=0) as fh:
                 while not self._stop.is_set():
                     t0 = time.monotonic()
@@ -1613,7 +2411,13 @@ class FileSource(IQSource):
                     # so the file is decoded consistently from end to end rather
                     # than switching convention partway through a replay.
                     self._detect_encoding(data)
-                    self.ring.write(data, self._tune_id)
+                    # Whole samples only: a recording whose length is odd ends
+                    # a read mid-pair, and the carried byte belongs to *this*
+                    # pass -- the next pass is a new stream, and its first byte
+                    # is an I of its own.
+                    held = self._take_carry(stream_id)
+                    pairs = self._keep_pairs(held + data if held else data, stream_id)
+                    self.ring.write(pairs, self._tune_id, stream_id)
                     self.stats.bytes_total += len(data)
                     if self.realtime:
                         deadline += period
@@ -1948,7 +2752,7 @@ class SimSource(IQSource):
             # the cost is paid once per retune, not once per block.
             if self.frequency_hz != freq_at_start:
                 continue
-            self.ring.write(u8.tobytes(), self._tune_id)
+            self.ring.write(u8.tobytes(), self._tune_id, self.stream_id)
             self.stats.bytes_total += u8.size
             # Pace to real time, allowing for what generation actually cost.
             # Waiting a flat n/fs *after* generating would hold the source below

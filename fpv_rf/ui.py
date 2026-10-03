@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import alerts, bands, dsp, fastscan, scan
+from . import acquisition, alerts, bands, dsp, fastscan, scan
 from .sdr import DEFAULT_SAMPLE_RATE, IQSource, make_source
 from .video import DecodeWorker, VideoFrame
 
@@ -634,7 +634,7 @@ class AlertBanner(QFrame):
         else:
             colour = KIND_COLOURS.get(ev.signal, QColor(220, 220, 220))
             self._head.setText(
-                f"RF ABOVE NOISE FLOOR   {ev.label} @ "
+                f"ANALOGUE VIDEO DETECTED   {ev.label} @ "
                 f"{bands.format_mhz(ev.frequency_hz)}"
             )
             self._head.setStyleSheet(f"color: {colour.name()};")
@@ -689,13 +689,11 @@ class ScanThread(QThread):
 
     def run(self) -> None:  # noqa: D102
         try:
-            res = fastscan.scan_span(
+            res = acquisition.acquire(
                 self.source, self.lo_hz, self.hi_hz,
-                hop_frac=self.hop_frac, sweeps=self.sweeps,
-                lna_db=getattr(self.source, "lna_gain_db", 32),
-                vga_db=getattr(self.source, "vga_gain_db", 16),
-                amp=bool(getattr(self.source, "amp_enabled", True)),
                 cancel=self._cancel,
+                frequencies=getattr(self, "frequencies", None),
+                auto_gain=getattr(self, "auto_gain", True),
                 progress=lambda m, f: self.progress.emit(m, f),
             )
         except Exception as exc:
@@ -704,7 +702,7 @@ class ScanThread(QThread):
         if (res.error and not res.candidates
                 and (res.engine in ("sweep", "none") or res.incomplete)):
             # A sweep that could not run is a failure, not an empty band. Saying
-            # "nothing above the noise floor" about a scan that never happened
+            # "no confirmed analogue video" about a scan that never happened
             # is the one answer that must never come out of this.
             #
             # "none" is the engine fastscan._acquisition_failure() stamps on a
@@ -765,6 +763,8 @@ class MainWindow(QMainWindow):
         #: dialog on the way out, where a modal box blocks the shutdown that
         #: would have reported it and there is no operator left to read it.
         self._closing = False
+        self.monitor = acquisition.Monitor(enabled=not getattr(
+            args, "no_autoscan", not getattr(args, "autoscan", True)))
         #: Prior enabled states of the tuning controls while a search runs.
         self._tuning_was: dict = {}
         #: When the close must stop waiting, as a monotonic deadline.
@@ -939,8 +939,7 @@ class MainWindow(QMainWindow):
             "This only applies to the hop-by-hop engine. The sweep engine\n"
             "always resolves to 1 MHz bins and ignores this."
         )
-        gv.addWidget(QLabel("grid"), 1, 0, 1, 2)
-        gv.addWidget(self.hop, 1, 2)
+        self.hop.hide()  # retained for diagnostic API compatibility
 
         self.sweeps = QComboBox()
         self.sweeps.addItem("1 pass", 1)
@@ -958,14 +957,12 @@ class MainWindow(QMainWindow):
             "average, so a pass that caught a burst is not diluted by the quiet\n"
             "ones around it."
         )
-        gv.addWidget(QLabel("passes"), 2, 0, 1, 2)
-        gv.addWidget(self.sweeps, 2, 2)
+        self.sweeps.hide()  # spectrum passes do not apply to video acquisition
 
         self.scan_btn = QPushButton("Scan band")
         self.scan_btn.setDefault(True)
         self.scan_btn.setToolTip(
-            "Sweep the whole search span and report every frequency with "
-            "energy above the noise floor."
+            "Check channel presets and stop on independently verified analogue video."
         )
         self.scan_btn.clicked.connect(self._on_scan)
         gv.addWidget(self.scan_btn, 3, 0, 1, 3)
@@ -986,7 +983,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self._on_cancel)
         gv.addWidget(self.cancel_btn, 4, 2)
 
-        self.autotune = QCheckBox("tune it automatically")
+        self.autotune = QCheckBox("tune verified video automatically")
         self.autotune.setChecked(True)
         self.autotune.setToolTip(
             "When a search finds something, tune it and show it, instead of\n"
@@ -996,12 +993,19 @@ class MainWindow(QMainWindow):
             "watching it are one action, not two."
         )
         gv.addWidget(self.autotune, 5, 0, 1, 3)
+        self.continuous = QCheckBox("keep searching / reacquire lost video")
+        self.continuous.setChecked(self.monitor.enabled)
+        self.continuous.toggled.connect(self._monitor_changed)
+        gv.addWidget(self.continuous, 6, 0, 1, 3)
+        self.auto_gain = QCheckBox("automatic receiver gain")
+        self.auto_gain.setChecked(True)
+        gv.addWidget(self.auto_gain, 7, 0, 1, 3)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
-        gv.addWidget(self.progress, 6, 0, 1, 3)
+        gv.addWidget(self.progress, 8, 0, 1, 3)
         v.addWidget(g)
 
         # -- display -----------------------------------------------------
@@ -1246,6 +1250,7 @@ class MainWindow(QMainWindow):
         # there would drop it from the seen-map and make the next sweep raise an
         # identical alert for the same drone.
         if clear_alerts:
+            self.monitor.completed(time.monotonic())
             self.alerts.clear()
         # The applied frequency, not the requested one. They are normally the
         # same, and when they are not the marker is claiming the panel is
@@ -1268,7 +1273,7 @@ class MainWindow(QMainWindow):
     #: a hop inside the sweep -- and no indication that anything overlapped.
     #: Reconfiguring the receiver is worse, because a spawn during a sweep is
     #: the handover race the sweep path goes to such lengths to avoid.
-    TUNING_CONTROLS = ("freq", "lna", "vga", "amp", "auto_btn", "chart")
+    TUNING_CONTROLS = ("freq", "lna", "vga", "amp", "auto_btn", "chart", "region", "auto_gain")
 
     def _set_scan_controls(self, running: bool) -> None:
         """Enable or disable everything that moves the receiver.
@@ -1324,7 +1329,10 @@ class MainWindow(QMainWindow):
             if announce:
                 self._status.showMessage("run a band search first")
             return False
-        best = self.scanner.suggest(self._last_result, self._active_band)
+        verified = scan.ScanResult(self._last_result.lo_hz, self._last_result.hi_hz,
+            candidates=[c for c in self._last_result.candidates
+                        if acquisition.video_present(c.reading)])
+        best = self.scanner.suggest(verified, self._active_band)
         if best is None:
             if self._active_band is not None and self._last_result.decodable:
                 self._status.showMessage(
@@ -1332,7 +1340,7 @@ class MainWindow(QMainWindow):
                     f"cleared to search every band"
                 )
             else:
-                self.banner.set_idle("nothing above the noise floor")
+                self.banner.set_idle("no confirmed analogue video")
                 if announce:
                     self._status.showMessage(
                         "no channel found -- auto-select deliberately declines "
@@ -1352,7 +1360,12 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"watching {best.label()}")
         return True
 
+    def _monitor_changed(self, enabled: bool) -> None:
+        self.monitor.enabled = enabled
+        self.monitor.next_scan = time.monotonic() + self.monitor.retry_s
+
     def _on_cancel(self) -> None:
+        self.continuous.setChecked(False)
         if self._scan_thread:
             self._scan_thread.cancel()
             self._status.showMessage("stopping the search...")
@@ -1387,36 +1400,21 @@ class MainWindow(QMainWindow):
         # history has to survive the sweep that follows the one that found it.
         th = ScanThread(self.source, lo_hz, hi_hz, self.hop.currentData(),
                         sweeps=self.sweeps.currentData(), parent=self)
+        th.frequencies = (list(self._active_band.channels)
+                          if self._active_band is not None else None)
+        th.auto_gain = self.auto_gain.isChecked()
         th.progress.connect(self._on_progress)
         th.finished_ok.connect(self._on_scan_done)
         th.failed.connect(self._on_scan_failed)
         self._scan_thread = th
+        th.finished.connect(lambda: self._retire_scan(th))
         th.start()
-        # Say which engine answered, before it answers, when it is knowable.
-        # An operator timing a scan needs to know whether 0.2 s means "fast" or
-        # "did not run", and the difference is not visible in the result.
-        #
-        # The engine question is read from the shared background probe, never
-        # asked here. ``fastscan.fast_ok`` starts the sweep helper with a 20 s
-        # timeout, and asking it on the GUI thread froze the window for up to
-        # twenty seconds at the moment the operator clicked the one button
-        # whose entire job is to be quick. The probe runs on a worker thread
-        # from startup; if it has not answered by the time a scan begins, the
-        # status line says so and the scan thread -- which is a worker thread,
-        # and is the thing that has to know -- waits for the real answer.
-        fastscan.start_probe()
-        if not getattr(self.source, "exclusive_use", False):
-            engine = f"hop-by-hop ({fastscan.why_not_fast(self.source)})"
-        else:
-            probed = fastscan.probe_result()
-            engine = ("sweep" if probed else
-                      f"hop-by-hop ({fastscan.why_not_fast(self.source)})"
-                      if probed is not None else
-                      "sweep or hop-by-hop (still checking the sweep tool)")
-        self._status.showMessage(
-            f"sweeping {bands.format_mhz(lo_hz)}-{bands.format_mhz(hi_hz)} "
-            f"using the {engine} engine"
-        )
+        self._status.showMessage("Searching for analogue video")
+
+    def _retire_scan(self, thread) -> None:
+        if self._scan_thread is thread:
+            self._scan_thread = None
+        thread.deleteLater()
 
     def _on_progress(self, message: str, frac: float) -> None:
         self.progress.setValue(int(frac * 1000))
@@ -1447,11 +1445,20 @@ class MainWindow(QMainWindow):
         still has to be announced -- silently returning to the previous channel
         would leave the operator thinking the search simply found nothing.
         """
+        self.monitor.completed(time.monotonic())
+        for control, value in ((self.lna, self.source.lna_gain_db),
+                               (self.vga, self.source.vga_gain_db)):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
         self.scan_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self._set_scan_controls(False)
         if res is not None:
             self.progress.setValue(1000)
+            # Only verified video is an acquisition. Spectrum-only findings
+            # remain available in the diagnostic scanner, never as FPV beeps.
+            res.candidates = [c for c in res.candidates if acquisition.video_present(c.reading)]
             self._last_result = res
             events = self.alerts.update(res)
             self._refresh_marks()
@@ -1459,14 +1466,14 @@ class MainWindow(QMainWindow):
             self._status.showMessage(res.describe())
             if not events:
                 self.banner.set_idle(
-                    "nothing above the noise floor"
+                    "no confirmed analogue video"
                     if not res.candidates
                     else f"already known: {self.alerts.active[0].label()}"
                     if self.alerts.active
                     else "idle"
                 )
         elif failure:
-            if not self._closing:
+            if not self._closing and not self.monitor.enabled:
                 # Suppressed while closing: a modal dialog on a window that is
                 # on its way out blocks the shutdown it was supposed to report
                 # on, and there is no operator left to read it.
@@ -1482,7 +1489,7 @@ class MainWindow(QMainWindow):
         # left the receiver somewhere the operator did not choose: auto-select
         # unticked, or a search that found nothing. The frequency box still read
         # the original channel, so the app claimed to be watching a channel it was
-        # not receiving, and said "nothing above the noise floor" while frozen on
+        # not receiving, and said "no confirmed analogue video" while frozen on
         # an arbitrary frequency.
         if res is not None and self.autotune.isChecked():
             # After the alert bookkeeping, not before: _tune() clears the
@@ -1490,6 +1497,7 @@ class MainWindow(QMainWindow):
             # look like it had never been raised.
             if self._select_best(announce=False):
                 self._pre_scan_hz = self.source.frequency_hz
+                self.monitor.acquired(time.monotonic())
                 return
         self._restore_pre_scan_tuning(res)
 
@@ -1504,6 +1512,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._apply_alert(ev))
 
     def _apply_alert(self, ev: alerts.AlertEvent) -> None:
+        if ev.kind is alerts.AlertKind.FOUND and ev.signal is not dsp.SignalKind.VIDEO:
+            return
         self._last_event = ev
         repeats = self._repeats_for(ev.frequency_hz)
         self.banner.set_event(ev, repeats)
@@ -1598,13 +1608,16 @@ class MainWindow(QMainWindow):
         nobody is on. Verbatim is also what :meth:`BandScanner.assess_frequency`
         documents for a hand-picked frequency.
         """
-        cand = self.scanner.assess_frequency(self.source.frequency_hz, snap=False)
+        cand = acquisition.confirm(self.source, self.source.frequency_hz)
         if cand is None:
+            self._last_result = scan.ScanResult(self.source.frequency_hz, self.source.frequency_hz)
+            self._status.showMessage("No confirmed analogue video at this frequency")
+            self.banner.set_idle("no confirmed analogue video")
             return
         res = scan.ScanResult(
             lo_hz=self.source.frequency_hz, hi_hz=self.source.frequency_hz
         )
-        if cand.reading.occupied:
+        if acquisition.video_present(cand.reading):
             res.candidates = [cand]
             events = self.alerts.update(res)
         else:
@@ -1657,6 +1670,15 @@ class MainWindow(QMainWindow):
         self.panel.set_frame(self.worker.latest())
 
     def _on_stats(self) -> None:
+        now = time.monotonic()
+        busy = bool(self._scan_thread and self._scan_thread.isRunning())
+        locked = self.worker.locked and self.worker.stats.sync_quality >= .60
+        if not self._closing and self.source.retunable and self.monitor.due(now, locked, busy):
+            if self.monitor.tracking:
+                self.alerts.lost(self.source.frequency_hz)
+            self.monitor.completed(now)
+            self._on_scan()
+            return
         st = self.worker.stats
         src = self.source.stats
         dropped = self.source.ring.dropped_bytes // 2
@@ -1734,6 +1756,7 @@ class MainWindow(QMainWindow):
         rather than destroyed: deleting a running QThread underneath itself is a
         crash, and refusing to close is worse.
         """
+        self.monitor.enabled = False
         if self._scan_thread and self._scan_thread.isRunning():
             self._closing = True
             self._scan_thread.cancel()
@@ -1789,14 +1812,6 @@ class MainWindow(QMainWindow):
 def run(source: IQSource, args) -> int:
     """Start the source and run the Qt event loop. Returns the exit code."""
     app = QApplication.instance() or QApplication([])
-    # Ask "can the sweep tool run here" now, in the background, rather than on
-    # the first band search. It starts the helper with a 20 s timeout to find
-    # out, and the operator who clicks "Scan band" should not be the one who
-    # pays for that question. Only for a source that could lend out a radio:
-    # the answer is fixed for the session, and asking it for a simulator would
-    # spawn a helper process to learn nothing.
-    if getattr(source, "exclusive_use", False):
-        fastscan.start_probe()
     source.start()
     win = MainWindow(source, args)
     win.show()

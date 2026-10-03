@@ -354,6 +354,20 @@ class AlertEngine:
             rec = self._seen.get(key)
             return rec[3] if rec else 0
 
+    def lost(self, frequency_hz: int) -> None:
+        """Report a tracked channel's observed loss, then permit reacquisition."""
+        now = self.clock()
+        with self._lock:
+            events = []
+            for key, record in list(self._seen.items()):
+                candidate = record[4]
+                if abs(candidate.frequency_hz - frequency_hz) <= SAME_TRANSMITTER_HZ:
+                    events.append(self._make(AlertKind.LOST, now, key, candidate, record[3]))
+                    del self._seen[key]
+            self.active = [c for c in self.active
+                           if abs(c.frequency_hz - frequency_hz) > SAME_TRANSMITTER_HZ]
+            self._emit(events)
+
     def clear(self) -> None:
         """Forget every finding. Used when the operator changes band or source."""
         with self._lock:

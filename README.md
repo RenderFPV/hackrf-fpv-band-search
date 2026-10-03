@@ -1,3 +1,34 @@
+# Receiver repair: video acquisition mode
+
+The GUI now searches channel presets directly and requires analogue-video
+structure in two independent IQ buffers before selecting a channel or sounding
+its acquisition alert. Bare RF carriers do not count as acquired FPV video.
+The older spectrum-scanning modules remain available to diagnostic tools.
+
+- **Keep searching / reacquire lost video** repeats unsuccessful searches after
+  two seconds and resumes searching after three seconds without decoded lock.
+- **Stop** cancels the current search and turns continuous searching off.
+- **Automatic receiver gain** makes bounded LNA/VGA corrections from sample
+  amplitude. Uncheck it to retain manual settings; RF amplifier selection stays
+  manual. The search tries nearby offsets only when sync evidence warrants it.
+- Select a band row to limit acquisition to its channels. Successful acquisition
+  returns immediately; it does not claim other channels were measured.
+- `--no-autoscan` disables automatic startup and continuous acquisition.
+
+Sync extraction now compares a delay-compensated 1 MHz FIR path with the raw
+path for marginal signals. Picture samples retain their bandwidth. Scanning and
+preview both require at least 0.60 sync quality; acquisition additionally needs
+consistent detections across fresh buffers.
+
+Validation: `python tools/check_acquisition.py`, `python tools/check_ui.py`,
+`python tools/check_review_fixes.py`, and stream/raster/diagnostic checks.
+Simulator and recorded-fixture checks do not substitute for a live VTX test.
+
+The historical documentation below describes the previous spectrum-first GUI;
+its sweep timing and RF-alert claims do not describe the new default mode.
+
+---
+
 # FPV RF: band search, channel select, and alerting
 
 Decodes analogue FPV video straight out of HackRF IQ — no capture card, no
@@ -112,16 +143,30 @@ automatically and will not report success without it passing.
 
 `build_exe.py` runs the self test **first**, before anything opens the radio,
 and that ordering is load-bearing rather than cosmetic. The self test measures
-sustained decode throughput, so it fails if something else is competing for the
-CPU, and tearing a HackRF down immediately before it is exactly that: the first
-build ran the radio check first and the self test measured 37.7 fps against a
-45 fps gate, while the same binary scored 50-55 fps three times in a row on its
-own. The same kind of flakiness is why `bench_sim` is a measurement and not an
-assertion.
+sustained publish throughput, so it fails if something else is competing for the
+CPU, and tearing a HackRF down immediately before it is exactly that. The same
+kind of flakiness is why `bench_sim` is a measurement and not an assertion.
 
-Measured on the packaged build: **50-59 fps** decode, 16/16 assertions, and
-`--check` passing against both the simulator and the live radio. The live radio
-correctly reports `noise only` when nothing is transmitting.
+The throughput gate is `0.7 * PREVIEW_HZ` — **21 fps** against the 30 Hz decode
+cadence — written that way in `check_ui.py` rather than as a literal, so a change
+of cadence moves the gate with it. It used to be a flat 45 fps, written when the
+decoder ran at the field rate and never revised when the cadence was cut to half
+of it: a 30 Hz decoder publishing at 30 Hz could not pass a 45 fps gate, so the
+number was not a throughput assertion at all, it was a contradiction. It is one
+now rather than merely "some frames appeared": 0.7 leaves a third of the cadence
+as headroom for a loaded machine and the first iteration's catch-up, while a
+decode that cannot complete an iteration inside 1/30 s publishes slower than that
+forever. The check prints the cadence and the gate beside the measured rate so the
+three can never be compared by mistake.
+
+The **50–59 fps** figure recorded for the packaged build in earlier revisions
+dates from when the cadence was the 60 Hz field rate and is not comparable to
+today's 30 Hz decoder; at 30 Hz the equivalent statement is "close to 30 fps".
+It has not been re-measured against a fresh 30 Hz build, and the packaged-build
+claim is not one this repository can establish on its own. What a source-tree run
+does establish is `check_ui.py`'s 16/16, which is the same assertion list
+`--selftest` makes inside the frozen build. The live radio correctly reports
+`noise only` when nothing is transmitting.
 
 ![panel](docs/ui_2_alert.png)
 
@@ -609,10 +654,113 @@ header rather than leaving it to be inferred:
 transmitting to be meaningful — it asserts the *absence* of a finding. It is
 also the one that would have caught the DC leak, and the sim would not have.
 
-`check_worker.py` reports **59.5 fields/s** on a 16.7 ms budget: drain 2.3 ms,
-decode 12.7 ms, cycle 17.5 ms, 1.00× real time from the source. The panel
-repaints at 60 Hz from the newest frame, so display and decode rates are the same
-number for different reasons and neither is the other's bottleneck.
+`check_worker.py` reports about **29–30 pictures/s** against the 30 Hz decode
+cadence (`PREVIEW_HZ`), which is a 33.3 ms budget: drain 2.5–3.6 ms, decode
+16–21 ms, cycle 32.8–33.2 ms, 1.00× real time from the source. The exact
+milliseconds move with the machine and it is the ratio that matters — the whole
+iteration fits inside the budget, so the decoder is keeping up. Decode is
+deliberately half the NTSC field rate, so the panel's 60 Hz repaint and the
+decoder's 30 Hz are different numbers for different reasons and neither is the
+other's bottleneck.
+
+Its **pass**, though, is a liveness verdict and not proof of a sustained rate.
+It waits for `MIN_FRAMES` — two cadences' worth — and gives up after 30 s, so a
+decoder managing 2 fps clears the same bar, only later, and the rate it prints
+alongside is reported rather than gated, because any threshold chosen there
+would be a statement about the machine it ran on. The gate on throughput is
+`check_ui.py`'s `MIN_FRAME_RATE`; `measure_stream_delivery.py` below is the
+measurement of the same path with the real worker thread and a real capture.
+
+### Delivery and continuity
+
+Two tools cover what `check_worker.py` does not: that every sample is accounted
+for, and what the pipeline actually costs on this machine.
+
+```
+python tools\check_stream_continuity.py   # seams, gaps, caps, overruns, identity
+python tools\measure_stream_delivery.py --realtime --seconds 2   # the same path, timed
+```
+
+`check_stream_continuity.py` pins the ring and drain contract — a capped skip
+discards the *oldest* samples, an overrun destroys what nobody read, a block that
+straddles a retune is refused whole, a block straddling a process restart is
+refused the same way, and `delivered == accepted + rejected` always holds. It also
+pins the three seams that used to pass silently: an overlap trim is *decoded*
+rather than counted and dropped — and one reaching into a span that was refused
+or poisoned starts a fresh segment, because that run continues nothing, so it
+takes no boundary step across it — a ring wrap keeps the history that spans it,
+and an oversized write reports the bytes it could not keep as loss instead of
+manufacturing a contiguous past it never had. It runs on the simulator and, if a
+capture is present, repeats the demodulation against the recorded bytes and
+requires it to be bit-identical.
+
+`measure_stream_delivery.py` runs the real worker thread over a real capture,
+wrapped at the demodulator, the sync detector and the rasteriser, and prints the
+phase timings, the publish rate against the 30 Hz cadence, stream lag and the
+delivery counters. It takes no gate on those numbers: it is a measurement, and
+what is fast is a property of the machine rather than of the decoder. Without
+`--realtime` it drains as fast as it can, which saturates the cap and shows the
+backlog path instead of the steady-state one.
+
+### Decode diagnostics (temporary)
+
+`fpv_rf/diag.py` is instrumentation for one question — why does a real 5.8 GHz
+downlink produce no picture — and it is meant to be deleted when that question
+is answered. It counts, once a second, what each stage of the decode chain last
+saw: buffers drained and bytes deliberately skipped, sync candidates and the
+threshold that produced them, the rasteriser's longest usable run and which stage
+refused it, frames started, completed and published. It counts whether or not a
+frame comes out, which is the case that matters and the one the statistics in
+`DecodeStats` are silent about by construction.
+
+Two independent switches, both off unless set, both environment variables so
+nothing has to be threaded through the UI:
+
+```
+set FPV_RF_DIAG=1                  # one aggregate DIAG line per second on stdout
+set FPV_RF_DIAG_DUMP=D:\cap\seg    # ... and bounded segments on disk
+```
+
+The app tees stdout to `fpv-rf.log`, so a live session needs the variable and a
+look at that file. A dump writes `<prefix>_NN_iq.u8` (raw interleaved bytes
+exactly as received, before scaling), `<prefix>_NN_demod.f32` and
+`<prefix>_NN.json` (sample rate, encoding, frequency, the tuning id at **each
+end** of the range, spawn epoch, absolute write range and the counters at that
+moment). It is bounded by `FPV_RF_DIAG_DUMP_SAMPLES` (1M complex samples, i.e.
+2 MB — half the 4 MiB ring), `FPV_RF_DIAG_DUMP_FILES` (4) and
+`FPV_RF_DIAG_DUMP_FLUSH_S` (5), so an enabled dump cannot fill a disk.
+
+The raw half is a **snapshot of the IQ ring** taken at the flush deadline, not a
+concatenation of drain hand-overs: a hand-over is capped, skips a backlog and
+begins wherever the drain cursor was, so several of them make a file whose bytes
+are in order but are not adjacent in the stream — gaps the metadata would not
+mention. The snapshot is taken without consuming, so reading the dump does not
+change what the decoder is credited with having received. If a snapshot straddles
+a retune it holds two frequencies, and since nothing in the samples says so, the
+JSON records `"spans_tune": true`, `"continuous": false` and both tuning ids; a
+segment following a transfer-process restart records
+`"after_process_restart"` the same way.
+
+```
+python tools\check_decode_diag.py   # the instrumentation is sound, and says so
+```
+
+That check is deliberately **not** in CI, because neither is the code it checks:
+it asserts the decode is pixel-identical with the variables unset and set, that
+counters move on a signal which never locks, that every drained byte is accounted
+for as delivered, skipped or lost in a range gap, that the dump is off by default
+and bounded when asked for, that the raw half of a segment is one contiguous
+non-consuming ring snapshot with its range and retune seams labelled, and that
+`dsp.detect_sync(collect_diag=True)` reports both polarities without changing the
+`SyncResult` it returns.
+
+To remove all of it: delete `fpv_rf/diag.py`, `tools\check_decode_diag.py`,
+every block marked `TEMP DIAG` in `dsp.py`, `sdr.py` and `video.py`, and this
+subsection. Two checks outside `tools\check_decode_diag.py` touch it and need
+their lines as well: `tools\check_stream_continuity.py` drives `diag.dump_tick`
+in its snapshot-neutrality case, and `tools\check_raster_window.py` calls
+`diag.reset()` and reads `Rasteriser._diag.gauge_value("reject")` to tell a
+refusal reason from a missing frame. Nothing else refers to any of it.
 
 ## The optional real capture
 

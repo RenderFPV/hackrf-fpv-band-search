@@ -226,7 +226,14 @@ def main() -> int:
     cmd.append(str(ROOT / "main.py"))
 
     t0 = time.monotonic()
-    run(cmd, cwd=ROOT)
+    # Dependency discovery must not collect incompatible DLLs from unrelated
+    # tools on PATH (for example Poppler's icuuc.dll instead of Windows ICU).
+    # PyInstaller's package hooks resolve Qt/NumPy/SciPy from this interpreter.
+    build_env = dict(os.environ)
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    build_env["PATH"] = os.pathsep.join((str(Path(sys.executable).parent),
+                                        str(system_root / "System32"), str(system_root)))
+    run(cmd, cwd=ROOT, env=build_env)
     print(f"\npackaged in {time.monotonic() - t0:.0f} s")
 
     out_dir = DIST / APP_NAME
@@ -279,12 +286,13 @@ def main() -> int:
     env = dict(os.environ, FPV_RF_NO_DIALOG="1", QT_QPA_PLATFORM="offscreen")
 
     # Order matters, and putting it back is expensive. The self test measures
-    # sustained decode throughput, so it fails if something else is competing for
-    # the CPU -- and opening a HackRF immediately before it is exactly that.
-    # The first build ran the radio check first and the self test measured
-    # 37.7 fps against a 45 fps gate; the same binary then scored 50-55 fps
-    # three times running on its own. So the throughput measurement goes first,
-    # on a quiet machine, and anything that touches the radio comes after it.
+    # sustained publish throughput, so it fails if something else is competing for
+    # the CPU -- and opening a HackRF immediately before it is exactly that. An
+    # earlier build ran the radio check first and the self test failed on a binary
+    # that was otherwise fine. So the throughput measurement goes first, on a
+    # quiet machine, and anything that touches the radio comes after it. The gate
+    # itself is check_ui.MIN_FRAME_RATE (0.7 * PREVIEW_HZ, 21 fps against the 30 Hz
+    # cadence), quoted from the cadence so the two cannot drift apart.
 
     log = out_dir / "fpv-rf.log"
 
@@ -300,6 +308,7 @@ def main() -> int:
     # test's verdict is destroyed by the checks that follow -- and the self test
     # is the one whose output is worth reading.
     selftest_log = read_log()
+    (out_dir / "selftest.log").write_text(selftest_log, encoding="utf-8")
 
     print("\nverifying the packaged build: --check (sim)", flush=True)
     rc = subprocess.run(

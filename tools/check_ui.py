@@ -22,9 +22,25 @@ import numpy as np  # noqa: E402
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from fpv_rf import bands, scan, sdr, ui  # noqa: E402
+from fpv_rf import bands, scan, sdr, ui, video  # noqa: E402
 
 OUT = Path("_validate_out")
+
+#: Lowest publish rate the self test accepts, as a fraction of the decode
+#: cadence. The gate used to be a flat 45 fps, which was written when the
+#: decoder ran at the field rate; the decode cadence is now deliberately half
+#: that (:data:`video.PREVIEW_HZ`, 30 Hz -- the panel repaints at 60 Hz from
+#: the newest picture and every extra field decoded is a second pass over a
+#: window the last one already read). So the gate now quotes the cadence it
+#: measures instead of a number that contradicts it.
+#:
+#: It is still a throughput assertion and not merely "some frames appeared":
+#: 0.7 leaves a third of the cadence as headroom for a loaded machine and for
+#: the first iteration's catch-up, while failing anything that has genuinely
+#: stopped keeping up -- a decode that cannot complete an iteration inside
+#: 1/30 s publishes slower than this forever. Quoted from PREVIEW_HZ rather than
+#: written out, so a change of cadence moves the gate with it.
+MIN_FRAME_RATE = 0.7 * video.PREVIEW_HZ
 
 
 class Args:
@@ -170,7 +186,9 @@ def main() -> int:
               f"decode {st.decode_ms:.1f} ms, cycle {st.cycle_ms:.1f} ms, "
               f"frame {shape}")
         results["picture decodes"] = f is not None and f.image.size > 0
-        results["frame rate"] = st.frame_rate() > 45.0
+        print(f"  decode cadence {video.PREVIEW_HZ:.0f} Hz, "
+              f"throughput gate {MIN_FRAME_RATE:.1f} fps")
+        results["frame rate"] = st.frame_rate() > MIN_FRAME_RATE
         check_display(win, results)
         shot(win, "1_locked", "picture plus band chart, no scan yet")
         win._on_scan()
@@ -263,7 +281,7 @@ def main() -> int:
         print(f"  on an empty band, auto-select said: "
               f"{win.banner._head.text()!r}")
         results["auto-select declines on a quiet band"] = (
-            "nothing above the noise floor" in win.banner._head.text()
+            "no confirmed analogue video" in win.banner._head.text()
         )
         shot(win, "5_empty", "empty band: no channel offered")
         win.close()

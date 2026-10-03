@@ -29,8 +29,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 
 import numpy as np
+
+# TEMP DIAG: counters and optional statistics for the decode-failure
+# investigation. Off unless FPV_RF_DIAG is set; delete this import and every
+# TEMP DIAG block below together with fpv_rf/diag.py.
+from . import diag
 
 try:  # scipy gives us a fast, well-filtered polyphase resampler
     from scipy.signal import resample_poly, firwin, lfilter
@@ -304,6 +310,217 @@ class SyncResult:
     threshold: float
     quality: float               # 0..1 fraction of well-spaced pulses
     spec: VideoSpec = field(default=NTSC)
+    #: TEMP DIAG: per-polarity detail, present only when ``detect_sync`` was
+    #: called with ``collect_diag=True``. None otherwise, and none of the
+    #: fields above are affected by its presence.
+    diag: "SyncDiag | None" = None
+
+
+# --------------------------------------------------------------------------
+# TEMP DIAG: sync diagnostics. Delete with fpv_rf/diag.py.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PolarityDiag:
+    """Everything one sign of the envelope produced, whether or not it won."""
+
+    polarity: int
+    threshold: float = 0.0
+    raw_edges: int = 0            # rising edges before clustering
+    clustered: int = 0            # edges that survived min_gap
+    quality: float = 0.0
+    near_count: int = 0           # gaps inside the +-12% tolerance band
+    diffs: int = 0                # gaps considered
+    density: float = 0.0          # clustered * line_samples / buffer
+    plaus: float = 0.0
+    rank: float = 0.0
+    line_samples: float = 0.0
+    spacing_min: float = 0.0
+    spacing_max: float = 0.0
+    spacing_mean: float = 0.0
+    spacing_median: float = 0.0
+    excursion_min: float = 0.0    # widths of complete above-threshold runs
+    excursion_median: float = 0.0
+    excursion_max: float = 0.0
+    chosen: bool = False
+
+    def flatten(self, prefix: str) -> dict[str, float]:
+        out = {
+            "thr": self.threshold,
+            "raw": self.raw_edges,
+            "clus": self.clustered,
+            "qual": self.quality,
+            "near": self.near_count,
+            "gaps": self.diffs,
+            "dens": self.density,
+            "plaus": self.plaus,
+            "rank": self.rank,
+            "line": self.line_samples,
+            "sp_min": self.spacing_min,
+            "sp_max": self.spacing_max,
+            "sp_mean": self.spacing_mean,
+            "sp_med": self.spacing_median,
+            "exc_min": self.excursion_min,
+            "exc_med": self.excursion_median,
+            "exc_max": self.excursion_max,
+            "chosen": int(self.chosen),
+        }
+        return {f"{prefix}_{k}": float(v) for k, v in out.items()}
+
+    # TEMP DIAG: the same numbers under their own names, for a JSON capture
+    # rather than a one-line log. Same source either way -- both are read out of
+    # the call, never re-derived -- so a capture and the per-second aggregate
+    # cannot disagree about the numbers behind a decision.
+    def as_dict(self) -> dict:
+        return {
+            "polarity": int(self.polarity),
+            "threshold": float(self.threshold),
+            "raw_edges": int(self.raw_edges),
+            "clustered": int(self.clustered),
+            "quality": float(self.quality),
+            "near_count": int(self.near_count),
+            "gaps_considered": int(self.diffs),
+            "density": float(self.density),
+            "plausibility": float(self.plaus),
+            "rank": float(self.rank),
+            "line_samples": float(self.line_samples),
+            "spacing_min": float(self.spacing_min),
+            "spacing_max": float(self.spacing_max),
+            "spacing_mean": float(self.spacing_mean),
+            "spacing_median": float(self.spacing_median),
+            "excursion_min": float(self.excursion_min),
+            "excursion_median": float(self.excursion_median),
+            "excursion_max": float(self.excursion_max),
+            "selected": bool(self.chosen),
+        }
+
+
+@dataclass
+class SyncDiag:
+    """The two-polarity decision, with the numbers behind it.
+
+    The thresholds here are the live ones -- read out of the call, not
+    re-derived -- so this describes the detector that actually ran rather than
+    a re-implementation of it.
+    """
+
+    sensitivity: float
+    nominal_line: float
+    min_gap: int
+    n_samples: int
+    early_break: bool = False     # would the live loop have stopped after one?
+    decided_polarity: int = 0     # the one the live loop would have stopped at
+    positive: PolarityDiag | None = None
+    negative: PolarityDiag | None = None
+
+    def flatten(self) -> dict[str, float]:
+        out: dict[str, float] = {
+            "sens": self.sensitivity,
+            "nominal": self.nominal_line,
+            "min_gap": float(self.min_gap),
+            "n": float(self.n_samples),
+            "early_break": float(self.early_break),
+            "decided_polarity": float(self.decided_polarity),
+        }
+        for name, side in (("pos", self.positive), ("neg", self.negative)):
+            if side is not None:
+                out.update(side.flatten(name))
+        return out
+
+    # TEMP DIAG: as_dict(), for a capture file. Both polarities are always
+    # present here -- the whole point of a publication-matched capture is that
+    # the polarity which lost is recorded beside the one that won, because
+    # "the decoder picked the wrong extreme" is only diagnosable from the pair.
+    def as_dict(self) -> dict:
+        return {
+            "sensitivity": float(self.sensitivity),
+            "nominal_line_samples": float(self.nominal_line),
+            "min_gap": int(self.min_gap),
+            "n_samples": int(self.n_samples),
+            "early_break": bool(self.early_break),
+            "decided_polarity": int(self.decided_polarity),
+            "positive": self.positive.as_dict() if self.positive else None,
+            "negative": self.negative.as_dict() if self.negative else None,
+        }
+
+
+def sync_diagnostics(
+    demod: np.ndarray,
+    sample_rate_hz: float,
+    spec: VideoSpec | None = None,
+    polarity: str = "auto",
+    sensitivity: float = 0.975,
+) -> SyncDiag:
+    """TEMP DIAG: :func:`detect_sync`'s per-polarity statistics, on demand.
+
+    A thin wrapper, so a tool reads the same numbers the live decoder does
+    instead of re-implementing the detector and disagreeing with it. Returns an
+    empty-ish result if detection raised or found nothing, never raises.
+    """
+    try:
+        got = detect_sync(
+            demod, sample_rate_hz, spec=spec, polarity=polarity,
+            sensitivity=sensitivity, collect_diag=True,
+        )
+    except Exception:
+        return SyncDiag(
+            sensitivity, expected_line_samples(sample_rate_hz, spec or NTSC), 0,
+            int(np.asarray(demod).size),
+        )
+    if got.diag is not None:
+        return got.diag
+    return SyncDiag(
+        sensitivity,
+        expected_line_samples(sample_rate_hz, spec or NTSC),
+        0,
+        int(np.asarray(demod).size),
+    )
+
+
+def _diag_record(sdiag: "SyncDiag | None", side: "PolarityDiag | None") -> None:
+    """TEMP DIAG: file one polarity's result under its own name."""
+    if sdiag is None or side is None:
+        return
+    if side.polarity > 0:
+        sdiag.positive = side
+    else:
+        sdiag.negative = side
+
+
+def _run_widths(mask: np.ndarray) -> np.ndarray:
+    """TEMP DIAG: widths of the *complete* above-threshold runs in ``mask``.
+
+    Read this as "how wide is the excursion the live threshold admits", not as
+    "how wide is a sync pulse". The threshold is a high percentile of the
+    envelope, so it normally cuts the top off a plateau instead of isolating it,
+    and a median of a few samples is what a healthy 10 MS/s signal reports. What
+    matters is the contrast between the two polarities and between a working
+    capture and a failing one: widths in the tens of samples, or a minimum far
+    below the median, mean the threshold is sitting somewhere else entirely.
+
+    Runs touching either end of the buffer are dropped rather than closed
+    artificially -- their width is not measurable, and inventing one would make
+    the minimum look better than it is.
+
+    Trimming has to be done before pairing. Transitions alternate, so a mask
+    that is already true at index 0 opens with a *falling* edge and one that is
+    still true at the end closes with a *rising* edge; zipping the two lists
+    anyway pairs an edge with one before it and reports negative widths, which
+    is how this first spelled it.
+    """
+    if mask.size < 2:
+        return np.zeros(0, dtype=np.int64)
+    up = np.flatnonzero(mask[1:] > mask[:-1]) + 1
+    down = np.flatnonzero(mask[1:] < mask[:-1]) + 1
+    if bool(mask[0]):
+        down = down[1:]        # that run opened before the buffer did
+    if bool(mask[-1]):
+        up = up[:-1]           # this one never closes inside it
+    n = int(min(up.size, down.size))
+    if n <= 0:
+        return np.zeros(0, dtype=np.int64)
+    return np.abs(down[:n] - up[:n]) + 1
 
 
 def _smooth(x: np.ndarray, taps: int) -> np.ndarray:
@@ -333,12 +550,51 @@ def _high_percentile(x: np.ndarray, pct: float, max_samples: int = 1 << 16) -> f
     return float(np.percentile(x[::step], pct))
 
 
-def detect_sync(
+@lru_cache(maxsize=8)
+def _sync_taps(sample_rate_hz: float) -> np.ndarray:
+    return firwin(31, min(1_000_000.0, sample_rate_hz * 0.2),
+                  fs=sample_rate_hz).astype(np.float32)
+
+
+def detect_sync(demod: np.ndarray, sample_rate_hz: float,
+                spec: VideoSpec | None = None, polarity: str = "auto",
+                sensitivity: float = 0.975, collect_diag: bool = False) -> SyncResult:
+    """Find sync on a separate noise-limited path without blurring the picture.
+
+    Clean signals retain the fast original path. On marginal inputs compare
+    conditioned timing against raw timing, including pulse density so a few
+    regularly spaced noise excursions cannot win on spacing alone. FIR delay
+    is removed: returned positions always address the caller's waveform.
+    """
+    raw = _detect_sync_unfiltered(demod, sample_rate_hz, spec, polarity,
+                                 sensitivity, collect_diag)
+    n = len(demod)
+    def rank(s):
+        density = len(s.pulse_starts) * s.line_samples / max(1, n)
+        return s.quality * float(np.exp(-((density - 1.0) / .35) ** 2))
+    if not _HAVE_SCIPY or (raw.quality >= .8 and rank(raw) >= .65):
+        return raw
+    taps = _sync_taps(float(sample_rate_hz))
+    delay = len(taps) // 2
+    padded = np.pad(np.asarray(demod, dtype=np.float32), (0, delay), mode="edge")
+    filtered = lfilter(taps, [1.0], padded)[delay:].astype(np.float32)
+    candidate = _detect_sync_unfiltered(filtered, sample_rate_hz, spec, polarity,
+                                       min(sensitivity, .94), collect_diag)
+    # Exclude edge padding and filter startup from timing observations.
+    keep = ((candidate.pulse_starts >= len(taps)) &
+            (candidate.pulse_starts < n - len(taps)))
+    candidate.pulse_starts = candidate.pulse_starts[keep]
+    candidate.pulse_centres = candidate.pulse_centres[keep]
+    return candidate if rank(candidate) > rank(raw) + .05 else raw
+
+
+def _detect_sync_unfiltered(
     demod: np.ndarray,
     sample_rate_hz: float,
     spec: VideoSpec | None = None,
     polarity: str = "auto",
     sensitivity: float = 0.975,
+    collect_diag: bool = False,
 ) -> SyncResult:
     """Locate horizontal sync pulses in a demodulated composite waveform.
 
@@ -390,6 +646,11 @@ def detect_sync(
     discriminator is that real sync yields roughly *one* line per line period,
     so the candidate's line density must sit near 1.0. Weighting spacing
     quality by a density plausibility term makes the choice decisive.
+
+    ``collect_diag`` (TEMP DIAG) additionally measures the polarity the live
+    loop would have skipped. It does not change the answer: once the loop would
+    have broken out, the winning candidate is locked in and the second polarity
+    can only report. Nothing here runs unless asked for.
     """
     x = np.asarray(demod, dtype=np.float32)
     if x.size < 64:
@@ -401,6 +662,11 @@ def detect_sync(
 
     env = x
 
+    # TEMP DIAG: read the live thresholds into the record instead of restating
+    # them, so this cannot drift from what the detector actually used.
+    sdiag = SyncDiag(sensitivity, float(nominal), min_gap, int(x.size)) if collect_diag else None
+    locked = False                       # TEMP DIAG: the live early-break, honoured
+
     pols = [1, -1] if polarity == "auto" else [1 if polarity == "positive" else -1]
     best: SyncResult | None = None
     best_score = -1.0
@@ -408,9 +674,11 @@ def detect_sync(
         score = sign * env
         thr = _high_percentile(score, sensitivity * 100.0)
         mask = score > thr
-        starts = _rising_edges(mask)
-        starts = _cluster(starts, min_gap)
+        raw_edges = _rising_edges(mask)
+        starts = _cluster(raw_edges, min_gap)
+        side = PolarityDiag(sign, thr, int(raw_edges.size), int(starts.size)) if sdiag else None
         if starts.size < 4:
+            _diag_record(sdiag, side)
             continue
         centres = _centroids(score, mask, starts)
         diffs = np.diff(centres)
@@ -423,8 +691,28 @@ def detect_sync(
         density = (starts.size * line_samples) / float(x.size)
         plaus = float(np.exp(-(((density - 1.0) / 0.35) ** 2)))
         rank = quality * plaus
-        if rank > best_score:
+        if side is not None:
+            side.quality = quality
+            side.near_count = int(np.count_nonzero(near))
+            side.diffs = int(diffs.size)
+            side.density = density
+            side.plaus = plaus
+            side.rank = rank
+            side.line_samples = line_samples
+            if diffs.size:
+                side.spacing_min = float(diffs.min())
+                side.spacing_max = float(diffs.max())
+                side.spacing_mean = float(diffs.mean())
+                side.spacing_median = float(np.median(diffs))
+            widths = _run_widths(mask)
+            if widths.size:
+                side.excursion_min = float(widths.min())
+                side.excursion_median = float(np.median(widths))
+                side.excursion_max = float(widths.max())
+        if rank > best_score and not locked:
             best_score = rank
+            if side is not None:
+                side.chosen = True
             best = SyncResult(
                 pulse_starts=starts,
                 pulse_centres=centres,
@@ -435,6 +723,8 @@ def detect_sync(
                 quality=quality,
                 spec=identify_standard(sample_rate_hz / line_samples),
             )
+        if sdiag is not None:
+            _diag_record(sdiag, side)
         # A candidate that is both well-spaced and at the right line density is
         # already unambiguous, and the opposite polarity only exists to catch
         # sign mistakes. Re-running the whole pipeline to confirm it doubles the
@@ -442,7 +732,15 @@ def detect_sync(
         # the answer is decisive. rank >= 0.5 with quality >= 0.8 cannot be
         # produced by locking onto picture detail.
         if best is not None and quality >= 0.8 and rank >= 0.5:
-            break
+            if sdiag is None:
+                break                        # the live path, unchanged
+            # TEMP DIAG: with a record to fill, keep going so the polarity that
+            # was skipped gets measured too -- but only the early break can
+            # change `best`, which is what `locked` is for.
+            if not sdiag.early_break:
+                sdiag.early_break = True
+                sdiag.decided_polarity = sign
+            locked = True
     if best is None:
         empty = np.zeros(0, dtype=np.float64)
         return SyncResult(
@@ -454,7 +752,9 @@ def detect_sync(
             threshold=0.0,
             quality=0.0,
             spec=ref,
+            diag=sdiag,                    # TEMP DIAG
         )
+    best.diag = sdiag                      # TEMP DIAG
     return best
 
 
@@ -611,6 +911,29 @@ class RasterFrame:
     #: different claim from one that needed none, and the count is carried so the
     #: caller can say which one it is showing.
     lines_from_grid: int = 0
+    #: Absolute half-open sample interval ``[first_sample, last_sample)`` of the
+    #: scanlines this picture was assembled from, when the caller said where its
+    #: demodulator window starts. Pure provenance: it names which part of the
+    #: stream a picture came from, so a consumer can tell a new picture from one
+    #: that re-used lines it has already been shown. ``(-1, -1)`` when the caller
+    #: could not place the window, which is a real answer -- an offline decode of
+    #: a bare array has no stream position -- and not the same as ``(0, 0)``.
+    first_sample: int = -1
+    last_sample: int = -1
+    #: TEMP DIAG: see fpv_rf/diag.py. How many of ``lines_used`` rows came from a
+    #: real sync detection rather than from :func:`line_grid`. It is the other
+    #: half of :attr:`lines_from_grid` -- ``detected + from_grid == lines_used`` --
+    #: and it is what says whether a frame was mostly *found* or mostly
+    #: reconstructed, which ``from_grid`` alone cannot distinguish from a window
+    #: that only ever needed filling.
+    lines_detected: int = 0
+    #: TEMP DIAG: the sample positions actually sampled for this frame, in the
+    #: order :meth:`_render` gathered them -- detected and grid-filled rows
+    #: alike. Kept so a published picture can be written out with the line
+    #: geometry it was drawn from, which is otherwise gone the moment ``push``
+    #: returns. ``want`` entries when a frame was produced; ``None`` otherwise.
+    #: The rasteriser is rebuilt on every reset, so this does not accumulate.
+    line_positions: "np.ndarray | None" = None
 
 
 @dataclass
@@ -771,6 +1094,9 @@ class Rasteriser:
         self._spec: VideoSpec | None = None
         self.frames_emitted = 0
         self.lines_skipped = 0
+        # TEMP DIAG: which stage refused, and what it was looking at. See
+        # fpv_rf/diag.py; counts only, no effect on the search.
+        self._diag = diag.section("raster")
 
     @property
     def spec(self) -> VideoSpec | None:
@@ -790,6 +1116,7 @@ class Rasteriser:
         want: int,
         tol_frac: float = 0.15,
         max_fill: int = 20,
+        diag_out: dict | None = None,
     ) -> LineRun | None:
         """Freshest run of ``want`` lines, bridging the signal's dropouts.
 
@@ -827,9 +1154,25 @@ class Rasteriser:
         real video. Only the lines' positions are reconstructed. Detected lines
         still get their own measured positions, and the number of reconstructed
         ones is reported on the frame rather than quietly absorbed.
+
+        ``diag_out`` (TEMP DIAG) receives a flat dict naming *which stage*
+        rejected: ``degenerate``, ``no_runs``, ``short_segment``, ``span``,
+        ``older``, ``no_positions``, ``coverage`` or ``none``. The gap
+        histogram, the inferred period and the longest run seen are in it too.
+        Nothing about the search itself changes.
         """
         n = int(starts.size)
+        d = diag_out if diag_out is not None else {}
+        d.clear()
+        d["want"] = int(want)
+        d["detections"] = n
+        d["max_fill"] = int(max_fill)
+        d["reason"] = "none"
+        d["max_span"] = 0
+        d["runs"] = 0
+        d["period"] = float(line_len)
         if n < 2 or want < 2 or line_len <= 0:
+            d["reason"] = "degenerate"
             return None
 
         # Walk the detections, turning each gap into an integer number of lines.
@@ -841,31 +1184,56 @@ class Rasteriser:
         period = float(np.median(single)) if single.size >= 3 else float(line_len)
         if not np.isfinite(period) or period <= 0:
             period = float(line_len)
+        d["period"] = period
         steps = np.maximum(1, np.rint(np.diff(starts) / period).astype(np.int64))
         line_no = np.concatenate(([0], np.cumsum(steps))).astype(np.int64)
+
+        # TEMP DIAG: what the missing lines actually look like. A cluster of
+        # one-line gaps is jitter; a handful of large ones is the signal
+        # dropping out, and the two call for different fixes.
+        missed = steps[steps > 1] - 1
+        if missed.size:
+            hist: dict[int, int] = {}
+            for m in missed.tolist():
+                hist[int(m)] = hist.get(int(m), 0) + 1
+            d["gap_hist"] = ",".join(f"{k}:{hist[k]}" for k in sorted(hist)[:12])
+            d["gap_max"] = int(missed.max())
+            d["gap_total"] = int(missed.sum())
+        else:
+            d["gap_hist"] = ""
+            d["gap_max"] = 0
+            d["gap_total"] = 0
 
         # Runs of consecutive line numbers, allowing a bounded fill.
         fillable = (steps - 1) <= int(max_fill)
         breaks = np.flatnonzero(~fillable) + 1
         bounds = np.concatenate(([0], breaks, [n]))
+        d["runs"] = int(bounds.size - 1)
 
         best: LineRun | None = None
         best_end = -1
+        reason = "no_runs"
         for k in range(bounds.size - 1):
             lo, hi = int(bounds[k]), int(bounds[k + 1])
             if hi - lo < 2:
+                reason = "short_segment"
                 continue
             span = int(line_no[hi - 1] - line_no[lo]) + 1
+            if span > int(d["max_span"]):
+                d["max_span"] = span
             if span < want:
+                reason = "span"
                 continue
             end = int(line_no[hi - 1])
             if end <= best_end:
+                reason = "older"
                 continue          # an older run cannot beat a fresher one
             # Freshest window inside this run: the last `want` lines.
             first = end - want + 1
             sel = (line_no >= first) & (line_no <= end)
             got = starts[sel]
             if got.size == 0:
+                reason = "no_positions"
                 continue
             sel_no = line_no[sel]
 
@@ -892,9 +1260,15 @@ class Rasteriser:
             detected = int(hit.sum())
             from_grid = int(want - detected)
             if chosen.size != want or detected == 0:
+                reason = "coverage"
                 continue
             best = LineRun(chosen, detected, from_grid)
             best_end = end
+        if best is None:
+            d["reason"] = reason
+        else:
+            d["detected"] = best.detected
+            d["from_grid"] = best.from_grid
         return best
     # -- main entry point --------------------------------------------------
 
@@ -905,10 +1279,24 @@ class Rasteriser:
         brightness: float = 1.0,
         contrast: float = 1.0,
         invert: bool = False,
+        origin: int = -1,
     ) -> RasterFrame | None:
-        """Rasterise the freshest complete field, or None if there isn't one."""
+        """Rasterise the freshest complete field, or None if there isn't one.
+
+        ``origin`` is the absolute source-sample index of ``demod[0]``, when the
+        caller knows it, and travels straight into the frame's
+        ``first_sample``/``last_sample``. It is the shortest possible statement
+        of "which part of the stream is this picture", and it has to be taken
+        here rather than reconstructed by the caller: the interval is a property
+        of the lines this call actually sampled, which after
+        :func:`limit_video_bandwidth` is not by inspection the buffer that was
+        decoded.
+        """
+        rd = self._diag
         starts = sync.pulse_starts
         if starts.size < 8:
+            rd.bump("reject_few_starts")
+            rd.gauge("reject", "few_starts")
             return None
         spec = sync.spec
         self._spec = spec
@@ -917,11 +1305,38 @@ class Rasteriser:
 
         offset = line * spec.crop_start
         span = line * spec.crop_width
-        # only lines whose whole active window is inside the buffer are usable
-        limit = demod.size - (offset + span)
-        if limit <= 0:
+        # A line is usable when its whole active window lies inside the buffer,
+        # and the window is addressed here exactly as :meth:`_render` addresses
+        # it: ``int(round(offset))`` samples in, ``int(round(span))`` samples
+        # wide, the start itself truncated to an int64. Eligibility looser or
+        # stricter than the render that follows it is a bug in itself, and this
+        # bound used to be both.
+        #
+        # It compared ``start + (offset + span)`` against
+        # ``size - (offset + span)`` -- two windows of padding where one is
+        # needed -- so the last row of an exactly-fitting field was thrown away.
+        # Measured: an NTSC field of 240 lines at 640 samples/line, offset
+        # 115.2 and span 486.4, whose last row ends at sample 153561, admits
+        # only 239 of its 240 rows; select_run then cannot find the 240-line run
+        # it requires and push refuses a field the renderer could have drawn.
+        # 288 PAL lines at the same period fail the same way. Deriving the bound
+        # in floats rather than in the render's own integers costs the same
+        # thing again, one sample at a time, wherever the float end of a row
+        # lands just past an integer sample count.
+        off_i = int(round(offset))
+        n_src = int(round(span))
+        rd.gauge("buffer_samples", int(demod.size))
+        rd.gauge("window_need", int(off_i + n_src))
+        if n_src < 8 or demod.size - off_i < n_src:
+            rd.bump("reject_buffer_short")
+            rd.gauge("reject", "buffer_short")
             return None
-        usable = starts[starts + offset + span <= limit]
+        row0 = starts.astype(np.int64) + off_i
+        # ``row0 >= 0`` as well as the upper end: a negative crop_start puts the
+        # window's first samples before the buffer, and a negative index does not
+        # fail there, it wraps round to the far end of the buffer and renders a
+        # row of the wrong picture.
+        usable = starts[(row0 >= 0) & (row0 + n_src <= demod.size)]
 
         # The floor on detections is the pigeonhole bound, not a tolerance knob:
         # :meth:`select_run` tolerates at most ``max_fill`` consecutive misses, so
@@ -930,20 +1345,69 @@ class Rasteriser:
         # made real captures undecodable, and the check has no meaning now that a
         # run may be partly reconstructed.
         floor = max(8, want // (self.max_fill + 1))
+        rd.gauge("usable", int(usable.size))
+        rd.gauge("floor", int(floor))
+        rd.gauge("want", int(want))
         if usable.size < floor:
+            rd.bump("reject_too_few_usable")
+            rd.gauge("reject", "too_few_usable")
             return None
 
-        run = self.select_run(usable, line, want, max_fill=self.max_fill)
+        run_info: dict = {}
+        run = self.select_run(
+            usable, line, want, max_fill=self.max_fill, diag_out=run_info
+        )
+        # TEMP DIAG: the search's own account of itself, promoted to gauges so it
+        # reaches the once-a-second line instead of dying with the call.
+        for k, v in run_info.items():
+            rd.gauge(f"run_{k}", v)
+        rd.bump("select_run_calls")
         if run is None:
             self.lines_skipped += 1
+            rd.bump("reject_no_run")
+            rd.gauge("reject", f"run_{run_info.get('reason', 'none')}")
             return None
+        rd.bump("runs_ok")
 
         rows = self._render(
             demod, run.positions, line, offset, span, spec, brightness, contrast, invert
         )
         if rows is None:
+            rd.bump("reject_render")
+            rd.gauge("reject", "render")
             return None
         self.frames_emitted += 1
+        rd.bump("frames")
+        rd.gauge("from_grid", int(run.from_grid))
+        rd.gauge("reject", "none")
+        if int(origin) >= 0:
+            # The interval of the *picture*: the first and last scanlines it was
+            # assembled from, in absolute samples. Not the interval of the whole
+            # demodulator window -- that grows to the window's length and then
+            # stops moving, because the window is full, so every field after the
+            # first few would carry the same numbers and no consumer could tell
+            # a new picture from the same field drawn again. These move by one
+            # field per field, which is what makes "is this a new picture"
+            # answerable rather than guessable.
+            #
+            # Derived from :meth:`_render`'s own integer addresses --
+            # ``int(run.positions[k]) + int(round(offset))``, then
+            # ``n_src`` samples wide -- because those are the samples actually
+            # gathered. The positions alone are the *sync detections*, which sit
+            # ``int(round(offset))`` samples before the picture does: NTSC's
+            # crop is 0.18 of a line, about 115 samples, so an interval quoted
+            # from the detections describes a stretch of stream 115 samples
+            # before the one the picture came from, at both ends, on every field.
+            # It read as a plausible number and it was wrong.
+            #
+            # ``last_sample`` is exclusive, as everywhere else in this codebase:
+            # demodulator output ``j`` is the phase step between IQ samples ``j``
+            # and ``j+1``, so the picture's samples are ``[lo, hi)`` and the
+            # second IQ sample supporting its final step is the one just outside.
+            lo = int(origin) + int(run.positions[0]) + off_i
+            hi = int(origin) + int(run.positions[-1]) + off_i + n_src
+        else:
+            lo = hi = -1
         return RasterFrame(
             image=rows,
             width=rows.shape[1],
@@ -954,6 +1418,12 @@ class Rasteriser:
             locked=True,
             quality=sync.quality,
             lines_from_grid=run.from_grid,
+            first_sample=lo,
+            last_sample=hi,
+            # TEMP DIAG: the line geometry, for a capture written beside the
+            # picture. Pure addition -- nothing below reads either field.
+            lines_detected=run.detected,
+            line_positions=run.positions,
         )
 
     # -- rendering ---------------------------------------------------------
@@ -1159,7 +1629,7 @@ def assess_channel(
     found: VideoSpec | None = None
     try:
         demod = fm_demodulate(iq)
-        sync = detect_sync(demod, sample_rate_hz, ref, polarity="auto", sensitivity=0.985)
+        sync = detect_sync(demod, sample_rate_hz, ref, polarity="auto", sensitivity=0.975)
         pulses = int(sync.pulse_centres.size)
         if pulses >= 8 and sync.line_samples > 1.0:
             expected = iq.size / sync.line_samples

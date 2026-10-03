@@ -50,7 +50,7 @@ from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fpv_rf import alerts, bands, dsp, fastscan, scan, sdr, video  # noqa: E402
+from fpv_rf import acquisition, alerts, bands, dsp, fastscan, scan, sdr, video  # noqa: E402
 from tools.check_alerts import cand, result  # noqa: E402
 from tools.check_ui import Args  # noqa: E402
 
@@ -480,10 +480,33 @@ def case_decode_exceptions_are_counted() -> bool:
 
     class Bad:
         def reset(self): pass
-        def push_iq(self, iq): raise ValueError("deliberate")
+        # The worker's current signature. It calls ``push_iq`` with
+        # ``continuous``, ``first_sample`` and the TEMP DIAG ``provenance``
+        # named, so a decoder accepting only the positional ``iq`` raises a
+        # TypeError about its *signature* -- which is counted, but is not the
+        # error this case exists to prove is visible.
+        def push_iq(self, iq, *, continuous=False, first_sample=None,
+                    provenance=None):
+            raise ValueError("deliberate")
 
     worker.decoder = Bad()
-    with patch.object(worker.source, "drain_iq", return_value=boom):
+    # ``drain_block``, not ``drain_iq``. The delivery primitive is the one that
+    # carries the absolute range and the producer identity, so it is the one the
+    # worker calls; the samples-only view is a convenience wrapper over it.
+    # Patching ``drain_iq`` left the real drain in place, which handed the worker
+    # an empty ring -- no block, no decode, no error -- and the case then asserted
+    # a decoder that was never reached.
+    block = sdr.IQBlock(
+        iq=boom,
+        first_sample=0,
+        last_sample=int(boom.size),
+        first_stream_id=1,
+        last_stream_id=1,
+        first_tune_id=1,
+        last_tune_id=1,
+        sample_rate=worker.source.sample_rate,
+    )
+    with patch.object(worker.source, "drain_block", return_value=block):
         worker.start()
         time.sleep(0.25)
         worker.stop()
@@ -518,16 +541,15 @@ def case_ui_quiet_check_does_not_alert() -> bool:
         win = _make_window(src, app)
     try:
         # The real handler, not a stub: the point is what the button does.
-        with patch.object(win.scanner, "assess_frequency",
-                          return_value=cand(kind=dsp.SignalKind.NOISE)):
+        with patch.object(acquisition, "confirm", return_value=None):
             win._check_current()
         good = ok("no alert was raised for a quiet channel",
                   len(win.alerts.log) == 0 and win._last_result.candidates == [],
                   f"{len(win.alerts.log)} event(s)")
         good &= ok("the operator is still told what was measured",
-                   "nothing above the noise floor" in win._status.currentMessage(),
+                   "No confirmed analogue video" in win._status.currentMessage(),
                    win._status.currentMessage()[:56])
-        with patch.object(win.scanner, "assess_frequency", return_value=cand()):
+        with patch.object(acquisition, "confirm", return_value=cand()):
             win._check_current()
         good &= ok("an occupied channel still alerts",
                    len(win.alerts.log) == 1)

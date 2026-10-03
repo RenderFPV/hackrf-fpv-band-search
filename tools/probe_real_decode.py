@@ -38,10 +38,10 @@ HACKRF_DEFAULT_MSPS = 10.0
 LOCK_QUALITY_FLOOR = 0.35
 
 #: Sync pulses per composite line is ~7.5 us out of ~63.5 us, so a line rate near
-#: 15.734 kHz (NTSC) or 25.0 kHz (PAL) is the real test. Anything else means the
+#: 15.734 kHz (NTSC) or 15.625 kHz (PAL) is the real test. Anything else means the
 #: sample rate is wrong, not that the video is.
 LINE_RATE_NTSC = 15_734.0
-LINE_RATE_PAL = 25_000.0
+LINE_RATE_PAL = 15_625.0
 LINE_RATE_TOL = 0.06
 
 
